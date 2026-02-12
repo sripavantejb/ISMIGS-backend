@@ -5,7 +5,7 @@ Full admin-panel backend: MongoDB (sector recipients, email logs, settings), JWT
 ## Setup
 
 1. `cd backend && npm install`
-2. Copy `.env.example` to `.env` and set `MONGODB_URI`, `JWT_SECRET`, optional SMTP credentials, and optional `OPENAI_API_KEY` (for email digest: LinkedIn-style post from insights + warnings).
+2. Copy `.env.example` to `.env` and set `MONGODB_URI`, `JWT_SECRET`, optional SMTP credentials, and **`OPENAI_API_KEY`** (required for test emails and digest: sector LinkedIn posts; get one at https://platform.openai.com/api-keys).
 3. Run `npm run dev` (or `npm start`).
 
 Server runs on port 3001. The frontend Vite app proxies `/api` to this server in development.
@@ -24,7 +24,17 @@ Server runs on port 3001. The frontend Vite app proxies `/api` to this server in
 - **GET/PATCH /api/settings** – admin settings (notifications_enabled, default_from)
 - **POST /api/settings/smtp-test** – send test email
 - **GET /api/email-logs** – list email send history
-- **POST /api/send-sector-email** – send test/real email (single sector or `sector_key: "all"`). Optional body: `insights[]`, `warnings[]` to send a LinkedIn-style digest (requires `OPENAI_API_KEY`).
+- **POST /api/send-sector-email** – send test/real email (single sector or `sector_key: "all"`). Test emails require `OPENAI_API_KEY` (sector LinkedIn post). Optional body: `insights[]`, `warnings[]` for digest (also requires `OPENAI_API_KEY`).
+
+## Deploying (e.g. Vercel)
+
+Set these **Environment Variables** in your backend project (e.g. ismigs-backend on Vercel):
+
+- **MONGODB_URI** – required
+- **JWT_SECRET** – required
+- **OPENAI_API_KEY** – required for test emails and digest (sector LinkedIn posts). Create at https://platform.openai.com/api-keys and add it in Vercel: Project → Settings → Environment Variables → add `OPENAI_API_KEY` for Production (and Preview if needed), then redeploy.
+
+Optional: SMTP_*, APPROVAL_BASE_URL, LINKEDIN_WEBHOOK_URL.
 
 ## Data (MongoDB, database: ismigs)
 
