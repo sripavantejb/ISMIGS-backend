@@ -147,7 +147,8 @@ app.post("/api/auth/login", async (req, res) => {
   return res.status(401).json({ error: "Invalid username or password." });
 });
 
-app.use("/api", requireAuth);
+// Auth skipped for now – no JWT required on /api routes
+// app.use("/api", requireAuth);
 
 app.get("/api/auth/me", (req, res) => {
   res.json({ user: req.user || "admin" });
