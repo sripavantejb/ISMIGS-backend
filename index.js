@@ -130,8 +130,21 @@ async function generateLinkedInDigest(insights, warnings) {
   return text;
 }
 
-async function generateSectorSamplePost(displayName) {
-  if (!OPENAI_API_KEY) return null;
+function getSectorType(sector_key) {
+  if (!sector_key || typeof sector_key !== "string") return "custom";
+  const idx = sector_key.indexOf(":");
+  if (idx <= 0) return "custom";
+  const type = sector_key.slice(0, idx).toLowerCase();
+  if (["custom", "energy", "wpi", "iip", "gva"].includes(type)) return type;
+  return "custom";
+}
+
+async function generateSectorSamplePost(sector_key, displayName) {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required for test emails");
+  const sectorType = getSectorType(sector_key);
+  const systemPrompt =
+    "You are a macro intelligence writer for ISMIGS (India State Macro Intelligence). Subscribers receive sector-specific notifications and updates on the ISMIGS dashboard. Write a short LinkedIn-style post that summarizes the kind of notifications and updates this sector sees: use the sector type and name to tailor content (e.g. IIP = industrial production indices and growth; WPI = wholesale price inflation; Energy = supply, consumption, and commodity prices; GVA = industry-wise GVA; Custom = general macro and policy updates). Be professional, data-driven, and suitable for policymakers and analysts. Maximum 150 words. No hashtags.";
+  const userPrompt = `Sector: ${displayName}. Sector type: ${sectorType}. Write a LinkedIn post summarizing the type of notifications and updates this sector would see on the ISMIGS dashboard.`;
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -141,15 +154,8 @@ async function generateSectorSamplePost(displayName) {
     body: JSON.stringify({
       model: "gpt-4o-mini",
       messages: [
-        {
-          role: "system",
-          content:
-            "You are a macro intelligence writer. Write a short LinkedIn-style post (2-3 sentences, professional, data-driven) for the given sector in the context of India macro intelligence (ISMIGS). Suitable for policymakers and analysts. Maximum 150 words. No hashtags.",
-        },
-        {
-          role: "user",
-          content: `Sector: ${displayName}. Generate a brief LinkedIn-style update for this sector.`,
-        },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
       ],
       max_tokens: 250,
       temperature: 0.4,
@@ -161,7 +167,8 @@ async function generateSectorSamplePost(displayName) {
   }
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content?.trim();
-  return text || null;
+  if (!text) throw new Error("OpenAI returned no content");
+  return text;
 }
 
 // ---------- Auth (no requireAuth) ----------
@@ -466,8 +473,15 @@ async function sendOneSector(sector_key, bodyEmails, isTest, settings, transport
   if (emails.length === 0) return { sent: 0, results: [] };
 
   const subject = isTest ? `ISMIGS – Test notification for ${displayName}` : `ISMIGS – Update for ${displayName}`;
-  const text = isTest ? `This is a test email from ISMIGS. You are receiving this because you are subscribed to sector: ${displayName}.` : `Update for sector: ${displayName}.`;
-  const html = text.replace(/\n/g, "<br>");
+  let text, html;
+  if (isTest) {
+    if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required for test emails.");
+    text = await generateSectorSamplePost(sector_key, displayName);
+    html = text.replace(/\n/g, "<br>");
+  } else {
+    text = `Update for sector: ${displayName}.`;
+    html = text.replace(/\n/g, "<br>");
+  }
 
   const results = [];
   for (const to of emails) {
@@ -558,14 +572,21 @@ app.post("/api/send-sector-email", async (req, res) => {
         return res.status(500).json({ error: e.message });
       }
     }
+    if (!OPENAI_API_KEY) {
+      return res.status(503).json({ error: "OPENAI_API_KEY required for test emails." });
+    }
     const results = [];
     let totalSent = 0, totalFailed = 0;
-    for (const row of sectors) {
-      const out = await sendOneSector(row.sector_key, row.emails, true, settings, transport, fromAddr);
-      const failed = (out.results || []).filter((r) => !r.ok).length;
-      totalSent += out.sent;
-      totalFailed += failed;
-      results.push({ sector_key: row.sector_key, sent: out.sent, failed });
+    try {
+      for (const row of sectors) {
+        const out = await sendOneSector(row.sector_key, row.emails, true, settings, transport, fromAddr);
+        const failed = (out.results || []).filter((r) => !r.ok).length;
+        totalSent += out.sent;
+        totalFailed += failed;
+        results.push({ sector_key: row.sector_key, sent: out.sent, failed });
+      }
+    } catch (e) {
+      return res.status(500).json({ error: e.message || "Test email send failed." });
     }
     return res.json({
       sent: totalSent,
@@ -607,22 +628,18 @@ app.post("/api/send-sector-email", async (req, res) => {
     }
   } else {
     subject = isTest ? `ISMIGS – Test notification for ${displayName}` : `ISMIGS – Update for ${displayName}`;
-    if (isTest && OPENAI_API_KEY) {
+    if (isTest) {
+      if (!OPENAI_API_KEY) {
+        return res.status(503).json({ error: "OPENAI_API_KEY required for test emails." });
+      }
       try {
-        const samplePost = await generateSectorSamplePost(displayName);
-        if (samplePost) {
-          text = samplePost;
-          html = text.replace(/\n/g, "<br>");
-        } else {
-          text = `This is a test email from ISMIGS. You are receiving this because you are subscribed to sector: ${displayName}.`;
-          html = text.replace(/\n/g, "<br>");
-        }
-      } catch (e) {
-        text = `This is a test email from ISMIGS. You are receiving this because you are subscribed to sector: ${displayName}.`;
+        text = await generateSectorSamplePost(sector_key, displayName);
         html = text.replace(/\n/g, "<br>");
+      } catch (e) {
+        return res.status(500).json({ error: e.message || "Sector LinkedIn post generation failed." });
       }
     } else {
-      text = isTest ? `This is a test email from ISMIGS. You are receiving this because you are subscribed to sector: ${displayName}.` : `Update for sector: ${displayName}.`;
+      text = `Update for sector: ${displayName}.`;
       html = text.replace(/\n/g, "<br>");
     }
   }
