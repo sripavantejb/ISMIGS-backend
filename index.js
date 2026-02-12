@@ -4,6 +4,7 @@
  * Run from backend folder: npm run dev
  */
 import "dotenv/config";
+import crypto from "crypto";
 import express from "express";
 import cors from "cors";
 import nodemailer from "nodemailer";
@@ -28,6 +29,7 @@ async function connectDb() {
   db = client.db(DB_NAME);
   await db.collection("admin_settings").createIndex({ key: 1 }, { unique: true }).catch(() => {});
   await db.collection("sector_recipients").createIndex({ sector_key: 1 }, { unique: true }).catch(() => {});
+  await db.collection("approval_requests").createIndex({ token: 1 }, { unique: true }).catch(() => {});
   return db;
 }
 
@@ -84,6 +86,31 @@ async function insertEmailLog(sector_key, recipient, subject, success, error_mes
     success: !!success,
     error_message: error_message || null,
   });
+}
+
+const APPROVAL_BASE_URL = (process.env.APPROVAL_BASE_URL || "").replace(/\/$/, "");
+const LINKEDIN_WEBHOOK_URL = process.env.LINKEDIN_WEBHOOK_URL || "";
+
+async function createApprovalRequest(sector_key, recipient, post_content) {
+  const database = getDb();
+  if (!database) throw new Error("MongoDB not configured");
+  const token = crypto.randomUUID();
+  const now = new Date().toISOString();
+  await database.collection("approval_requests").insertOne({
+    token,
+    sector_key: sector_key || "",
+    recipient: recipient || "",
+    post_content: post_content || "",
+    status: "pending",
+    created_at: now,
+    decided_at: null,
+  });
+  return token;
+}
+
+function buildApprovalLink(token) {
+  if (!APPROVAL_BASE_URL) return "";
+  return `${APPROVAL_BASE_URL}/approve?token=${encodeURIComponent(token)}`;
 }
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -493,20 +520,26 @@ app.post("/api/send-sector-email", async (req, res) => {
     if (hasDigestInput) {
       try {
         const digestText = await generateLinkedInDigest(insights, warnings);
-        const digestSubject = "ISMIGS – Top insights & critical warnings";
-        const digestHtml = digestText.replace(/\n/g, "<br>");
+        const digestSubject = "ISMIGS – LinkedIn post for your approval";
         const results = [];
         let totalSent = 0, totalFailed = 0;
         for (const row of sectors) {
           let sent = 0, failed = 0;
           for (const to of row.emails || []) {
             try {
+              const token = await createApprovalRequest(row.sector_key, to, digestText);
+              const approvalLink = buildApprovalLink(token);
+              const approvalLine = approvalLink
+                ? `Please confirm if we may use this post. Approve or reject here: ${approvalLink}.`
+                : "Approval link not configured (APPROVAL_BASE_URL).";
+              const text = `${digestText}\n\n${approvalLine}`;
+              const html = digestText.replace(/\n/g, "<br>") + (approvalLink ? `<br><br><p>Please confirm if we may use this post. <a href="${approvalLink}">Approve or reject here</a>.</p>` : `<br><br><p>${approvalLine}</p>`);
               await transport.sendMail({
                 from: fromAddr,
                 to,
                 subject: digestSubject,
-                text: digestText,
-                html: digestHtml,
+                text,
+                html,
               });
               sent++;
               totalSent++;
@@ -565,9 +598,10 @@ app.post("/api/send-sector-email", async (req, res) => {
   let subject, text, html;
   if (hasDigestInput) {
     try {
-      text = await generateLinkedInDigest(insights, warnings);
-      subject = "ISMIGS – Top insights & critical warnings";
-      html = text.replace(/\n/g, "<br>");
+      const postContent = await generateLinkedInDigest(insights, warnings);
+      subject = "ISMIGS – LinkedIn post for your approval";
+      text = postContent;
+      html = postContent.replace(/\n/g, "<br>");
     } catch (e) {
       return res.status(500).json({ error: e.message });
     }
@@ -596,14 +630,24 @@ app.post("/api/send-sector-email", async (req, res) => {
     const results = [];
     for (const to of emails) {
       try {
+        let mailText = text, mailHtml = html;
+        if (hasDigestInput) {
+          const token = await createApprovalRequest(sector_key, to, text);
+          const approvalLink = buildApprovalLink(token);
+          const approvalLine = approvalLink
+            ? `Please confirm if we may use this post. Approve or reject here: ${approvalLink}.`
+            : "Approval link not configured (APPROVAL_BASE_URL).";
+          mailText = `${text}\n\n${approvalLine}`;
+          mailHtml = html + (approvalLink ? `<br><br><p>Please confirm if we may use this post. <a href="${approvalLink}">Approve or reject here</a>.</p>` : `<br><br><p>${approvalLine}</p>`);
+        }
         await transport.sendMail({
           from: fromAddr,
           to,
           cc: cc.length ? cc : undefined,
           bcc: bcc.length ? bcc : undefined,
           subject,
-          text,
-          html,
+          text: mailText,
+          html: mailHtml,
         });
         results.push({ to, ok: true });
         await insertEmailLog(sector_key, to, subject, true, null);
@@ -620,6 +664,64 @@ app.post("/api/send-sector-email", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+app.get("/api/approve/:token", async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "Service unavailable" });
+  const token = req.params.token;
+  if (!token) return res.status(400).json({ error: "Token required" });
+  const doc = await database.collection("approval_requests").findOne({ token });
+  if (!doc || doc.status !== "pending") return res.status(404).json({ error: "Invalid or expired approval link" });
+  return res.json({
+    post_content: doc.post_content,
+    sector_key: doc.sector_key,
+    recipient: doc.recipient,
+  });
+});
+
+app.post("/api/approve/:token", async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "Service unavailable" });
+  const token = req.params.token;
+  const approved = req.body && req.body.approved === true;
+  const rejected = req.body && req.body.approved === false;
+  if (!token) return res.status(400).json({ error: "Token required" });
+  if (!approved && !rejected) return res.status(400).json({ error: "Body must include approved: true or approved: false" });
+  const doc = await database.collection("approval_requests").findOne({ token });
+  if (!doc || doc.status !== "pending") return res.status(404).json({ error: "Invalid or expired approval link" });
+  const now = new Date();
+  await database.collection("approval_requests").updateOne(
+    { token },
+    { $set: { status: approved ? "approved" : "rejected", decided_at: now.toISOString() } }
+  );
+  if (approved) {
+    await database.collection("linkedin_posts").insertOne({
+      approval_request_id: doc._id,
+      sector_key: doc.sector_key,
+      recipient: doc.recipient,
+      post_content: doc.post_content,
+      approved_at: now.toISOString(),
+    });
+    if (LINKEDIN_WEBHOOK_URL) {
+      try {
+        await fetch(LINKEDIN_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            post_content: doc.post_content,
+            sector_key: doc.sector_key,
+            recipient: doc.recipient,
+            approved_at: now.toISOString(),
+          }),
+        });
+      } catch (e) {
+        // log but do not fail the request
+        console.error("Webhook POST failed:", e.message);
+      }
+    }
+  }
+  return res.json({ success: true, message: approved ? "Post approved and submitted for publishing." : "Post rejected." });
 });
 
 app.post("/api/send-email", async (req, res) => {
