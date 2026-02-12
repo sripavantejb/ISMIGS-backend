@@ -14,10 +14,10 @@ const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
 
-const JWT_SECRET = "ismigs-dev-secret-change-in-production";
-const ADMIN_USERNAME = "admin";
-const ADMIN_PASSWORD = "admin123";
-const MONGODB_URI = "mongodb+srv://myselfyourstej_db_user:ismigs@cluster0.eq96ml6.mongodb.net/?appName=Cluster0";
+const JWT_SECRET = process.env.JWT_SECRET || "ismigs-dev-secret-change-in-production";
+const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || "admin").trim();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://myselfyourstej_db_user:ismigs@cluster0.eq96ml6.mongodb.net/?appName=Cluster0";
 
 let db = null;
 const DB_NAME = "ismigs";
@@ -134,7 +134,9 @@ async function generateLinkedInDigest(insights, warnings) {
 
 app.post("/api/auth/login", async (req, res) => {
   const { username, password } = req.body || {};
-  if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
+  const u = typeof username === "string" ? username.trim() : "";
+  const p = typeof password === "string" ? password : "";
+  if (u === ADMIN_USERNAME && p === ADMIN_PASSWORD) {
     const token = jwt.sign(
       { sub: "admin", iat: Math.floor(Date.now() / 1000) },
       JWT_SECRET,
