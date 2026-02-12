@@ -130,6 +130,40 @@ async function generateLinkedInDigest(insights, warnings) {
   return text;
 }
 
+async function generateSectorSamplePost(displayName) {
+  if (!OPENAI_API_KEY) return null;
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a macro intelligence writer. Write a short LinkedIn-style post (2-3 sentences, professional, data-driven) for the given sector in the context of India macro intelligence (ISMIGS). Suitable for policymakers and analysts. Maximum 150 words. No hashtags.",
+        },
+        {
+          role: "user",
+          content: `Sector: ${displayName}. Generate a brief LinkedIn-style update for this sector.`,
+        },
+      ],
+      max_tokens: 250,
+      temperature: 0.4,
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`OpenAI API error: ${res.status} ${errText.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = data.choices?.[0]?.message?.content?.trim();
+  return text || null;
+}
+
 // ---------- Auth (no requireAuth) ----------
 
 app.post("/api/auth/login", async (req, res) => {
@@ -573,8 +607,24 @@ app.post("/api/send-sector-email", async (req, res) => {
     }
   } else {
     subject = isTest ? `ISMIGS – Test notification for ${displayName}` : `ISMIGS – Update for ${displayName}`;
-    text = isTest ? `This is a test email from ISMIGS. You are receiving this because you are subscribed to sector: ${displayName}.` : `Update for sector: ${displayName}.`;
-    html = text.replace(/\n/g, "<br>");
+    if (isTest && OPENAI_API_KEY) {
+      try {
+        const samplePost = await generateSectorSamplePost(displayName);
+        if (samplePost) {
+          text = samplePost;
+          html = text.replace(/\n/g, "<br>");
+        } else {
+          text = `This is a test email from ISMIGS. You are receiving this because you are subscribed to sector: ${displayName}.`;
+          html = text.replace(/\n/g, "<br>");
+        }
+      } catch (e) {
+        text = `This is a test email from ISMIGS. You are receiving this because you are subscribed to sector: ${displayName}.`;
+        html = text.replace(/\n/g, "<br>");
+      }
+    } else {
+      text = isTest ? `This is a test email from ISMIGS. You are receiving this because you are subscribed to sector: ${displayName}.` : `Update for sector: ${displayName}.`;
+      html = text.replace(/\n/g, "<br>");
+    }
   }
 
   let transport, fromAddr;
