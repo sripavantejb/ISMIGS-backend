@@ -34,7 +34,7 @@ Set these **Environment Variables** in your backend project (e.g. ismigs-backend
 - **JWT_SECRET** – required
 - **OPENAI_API_KEY** – required for test emails and digest (sector LinkedIn posts). Create at https://platform.openai.com/api-keys and add it in Vercel: Project → Settings → Environment Variables → add `OPENAI_API_KEY` for Production (and Preview if needed), then redeploy. Optional **OPEN_AI_API_KEY_ADMIN** is used when the primary key is unset or when a request returns 401.
 
-- **FRONTEND_BASE_URL** – set to your deployed frontend URL (e.g. `https://ismigs-frontend.vercel.app`) so that after clicking Yes/No in the disclosure email, users are redirected to the deployed site instead of localhost.
+- **FRONTEND_BASE_URL** – **required in production.** Set to your deployed frontend URL (e.g. `https://ismigs-frontend.vercel.app`). Without it, Yes/No redirects return 503 and users cannot reach the decision page after clicking the email link.
 
 Optional: SMTP_*, APPROVAL_BASE_URL, LINKEDIN_WEBHOOK_URL.
 

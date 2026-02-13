@@ -214,18 +214,30 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const CRON_SECRET = process.env.CRON_SECRET || "change-me-cron-secret";
 
 function getFrontendBaseUrl() {
-  const explicit = (process.env.FRONTEND_BASE_URL || process.env.VITE_APP_URL || "").trim().replace(/\/$/, "");
+  const explicit = (process.env.FRONTEND_BASE_URL || process.env.FRONTEND_PUBLIC_URL || process.env.VITE_APP_URL || "")
+    .trim()
+    .replace(/\/$/, "");
   if (explicit) return explicit;
-  if (process.env.VERCEL_URL) {
-    const fallback = (process.env.FRONTEND_PUBLIC_URL || "").trim().replace(/\/$/, "");
-    if (fallback) return fallback;
-  }
+  if (process.env.VERCEL_URL) return null;
   return "http://localhost:5173";
 }
 
 function getDecisionRedirectUrl(result) {
   const base = getFrontendBaseUrl();
+  if (!base) return null;
   return `${base}/admin/decision?result=${result}`;
+}
+
+const FRONTEND_URL_CONFIG_HTML =
+  "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Configuration required</title></head><body><h1>Configuration required</h1><p>Set <strong>FRONTEND_BASE_URL</strong> in your backend environment (e.g. Vercel → Project → Settings → Environment Variables) to your deployed frontend URL (e.g. <code>https://your-frontend.vercel.app</code>), then redeploy. Without it, Yes/No redirects cannot work in production.</p></body></html>";
+
+function redirectOrConfigError(res, result) {
+  const url = getDecisionRedirectUrl(result);
+  if (!url) {
+    res.status(503).setHeader("Content-Type", "text/html; charset=utf-8").send(FRONTEND_URL_CONFIG_HTML);
+    return;
+  }
+  res.redirect(url);
 }
 
 function getBackendPublicUrl() {
@@ -1038,26 +1050,26 @@ app.get("/api/admin/decision", async (req, res) => {
   const { token, type } = req.query || {};
   const database = getDb();
   if (!token || typeof token !== "string") {
-    return res.redirect(getDecisionRedirectUrl("expired"));
+    return redirectOrConfigError(res, "expired");
   }
   if (!database) {
-    return res.redirect(getDecisionRedirectUrl("expired"));
+    return redirectOrConfigError(res, "expired");
   }
   const doc = await database.collection("admin_decisions").findOne({ token });
   if (!doc) {
     console.warn("Admin decision: token not found", token);
-    return res.redirect(getDecisionRedirectUrl("expired"));
+    return redirectOrConfigError(res, "expired");
   }
   const now = new Date();
   if (new Date(doc.expires_at) < now) {
-    return res.redirect(getDecisionRedirectUrl("expired"));
+    return redirectOrConfigError(res, "expired");
   }
   if (doc.status !== "pending") {
-    return res.redirect(getDecisionRedirectUrl(doc.status === "approved" ? "approved" : "rejected"));
+    return redirectOrConfigError(res, doc.status === "approved" ? "approved" : "rejected");
   }
   const action = type === "approve" ? "approved" : type === "reject" ? "rejected" : null;
   if (!action) {
-    return res.redirect(getDecisionRedirectUrl("expired"));
+    return redirectOrConfigError(res, "expired");
   }
   await database.collection("admin_decisions").updateOne(
     { token },
@@ -1071,7 +1083,7 @@ app.get("/api/admin/decision", async (req, res) => {
       console.error("n8n webhook error after approval:", err.message);
     }
   }
-  return res.redirect(getDecisionRedirectUrl(action === "approved" ? "approved" : "rejected"));
+  return redirectOrConfigError(res, action === "approved" ? "approved" : "rejected");
 });
 
 app.get("/api/energy-commodities", async (_req, res) => {
@@ -1447,8 +1459,8 @@ connectDb()
       const mongo = db ? "MongoDB ok" : "MongoDB not connected";
       const smtp = smtpHost && smtpUser && smtpPass ? "SMTP ok" : "SMTP not set (optional)";
       console.log(`ISMIGS backend listening on port ${port} | ${mongo} | ${smtp}`);
-      if (process.env.VERCEL_URL && getFrontendBaseUrl().includes("localhost")) {
-        console.warn("FRONTEND_BASE_URL not set; decision redirect will go to localhost.");
+      if (process.env.VERCEL_URL && !getFrontendBaseUrl()) {
+        console.warn("FRONTEND_BASE_URL not set; Yes/No redirect will return 503 until you set it to your deployed frontend URL.");
       }
     });
   })
@@ -1457,8 +1469,8 @@ connectDb()
     app.listen(port, () => {
       const smtp = smtpHost && smtpUser && smtpPass ? "SMTP ok" : "SMTP not set (optional)";
       console.log(`ISMIGS backend listening on port ${port} (no DB) | ${smtp}`);
-      if (process.env.VERCEL_URL && getFrontendBaseUrl().includes("localhost")) {
-        console.warn("FRONTEND_BASE_URL not set; decision redirect will go to localhost.");
+      if (process.env.VERCEL_URL && !getFrontendBaseUrl()) {
+        console.warn("FRONTEND_BASE_URL not set; Yes/No redirect will return 503 until you set it to your deployed frontend URL.");
       }
     });
   });
