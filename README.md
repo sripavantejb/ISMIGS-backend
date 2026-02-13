@@ -36,6 +36,8 @@ Set these **Environment Variables** in your backend project (e.g. ismigs-backend
 
 - **FRONTEND_BASE_URL** – **required in production.** Set to your deployed frontend URL (e.g. `https://ismigs-frontend.vercel.app`). Without it, Yes/No redirects return 503 and users cannot reach the decision page after clicking the email link.
 
+When using the deployed frontend for the admin panel, ensure the frontend does not set `VITE_API_URL` to localhost so the admin panel and the email Yes/No link use the same backend; then the "LinkedIn post approval status" table will show "Approved for LinkedIn" after an admin clicks Yes.
+
 Optional: SMTP_*, APPROVAL_BASE_URL, LINKEDIN_WEBHOOK_URL.
 
 ## Data (MongoDB, database: ismigs)
