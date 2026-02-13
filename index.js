@@ -1229,7 +1229,12 @@ app.post("/api/admin/run-sector-alerts", requireAuth, async (req, res) => {
     res.json({ ok: true, results });
   } catch (e) {
     if (e.message === "MongoDB not configured.") return res.status(503).json({ error: e.message });
-    if (e.message.startsWith("Failed to fetch commodities")) return res.status(502).json({ error: e.message });
+    if (e.message.startsWith("Failed to fetch commodities")) {
+      const msg = /fetch failed|ECONNREFUSED|ETIMEDOUT|aborted|network/i.test(e.message)
+        ? "Commodity data source is temporarily unreachable. Please try again in a moment."
+        : e.message;
+      return res.status(502).json({ error: msg });
+    }
     res.status(500).json({ error: e.message || "Run sector alerts failed." });
   }
 });

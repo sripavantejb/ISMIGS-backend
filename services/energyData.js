@@ -6,6 +6,27 @@
 const MOSPI_BASE = process.env.MOSPI_API_BASE || "https://api.mospi.gov.in/api";
 const ENERGY_BASE = `${MOSPI_BASE}/energy/getEnergyRecords`;
 
+const FETCH_RETRIES = 3;
+const FETCH_RETRY_DELAY_MS = 1500;
+
+async function fetchWithRetry(url) {
+  let lastErr;
+  for (let attempt = 1; attempt <= FETCH_RETRIES; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 25000);
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      lastErr = e;
+      if (attempt < FETCH_RETRIES) await new Promise((r) => setTimeout(r, FETCH_RETRY_DELAY_MS));
+    }
+  }
+  throw lastErr;
+}
+
 function parseFiscalYear(yearStr) {
   if (!yearStr) return NaN;
   const match = /^(\d{4})/.exec(String(yearStr));
@@ -14,17 +35,13 @@ function parseFiscalYear(yearStr) {
 
 export async function fetchSupplyRecords() {
   const url = `${ENERGY_BASE}?indicator_code=${encodeURIComponent("Energy Balance ( in PetaJoules )")}&use_of_energy_balance_code=Supply&Format=JSON&limit=555`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Supply API error: ${res.status}`);
-  const json = await res.json();
+  const json = await fetchWithRetry(url);
   return json.data || [];
 }
 
 export async function fetchConsumptionRecords() {
   const url = `${ENERGY_BASE}?indicator_code=${encodeURIComponent("Energy Balance ( in KToE )")}&use_of_energy_balance_code=Consumption&Format=JSON&limit=7000`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Consumption API error: ${res.status}`);
-  const json = await res.json();
+  const json = await fetchWithRetry(url);
   return json.data || [];
 }
 
