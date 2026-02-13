@@ -212,10 +212,19 @@ async function generateSectorSamplePost(sector_key, displayName) {
 
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const CRON_SECRET = process.env.CRON_SECRET || "change-me-cron-secret";
-const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || process.env.VITE_APP_URL || "http://localhost:5173";
+
+function getFrontendBaseUrl() {
+  const explicit = (process.env.FRONTEND_BASE_URL || process.env.VITE_APP_URL || "").trim().replace(/\/$/, "");
+  if (explicit) return explicit;
+  if (process.env.VERCEL_URL) {
+    const fallback = (process.env.FRONTEND_PUBLIC_URL || "").trim().replace(/\/$/, "");
+    if (fallback) return fallback;
+  }
+  return "http://localhost:5173";
+}
 
 function getDecisionRedirectUrl(result) {
-  const base = FRONTEND_BASE_URL.replace(/\/$/, "");
+  const base = getFrontendBaseUrl();
   return `${base}/admin/decision?result=${result}`;
 }
 
@@ -1438,6 +1447,9 @@ connectDb()
       const mongo = db ? "MongoDB ok" : "MongoDB not connected";
       const smtp = smtpHost && smtpUser && smtpPass ? "SMTP ok" : "SMTP not set (optional)";
       console.log(`ISMIGS backend listening on port ${port} | ${mongo} | ${smtp}`);
+      if (process.env.VERCEL_URL && getFrontendBaseUrl().includes("localhost")) {
+        console.warn("FRONTEND_BASE_URL not set; decision redirect will go to localhost.");
+      }
     });
   })
   .catch((err) => {
@@ -1445,5 +1457,8 @@ connectDb()
     app.listen(port, () => {
       const smtp = smtpHost && smtpUser && smtpPass ? "SMTP ok" : "SMTP not set (optional)";
       console.log(`ISMIGS backend listening on port ${port} (no DB) | ${smtp}`);
+      if (process.env.VERCEL_URL && getFrontendBaseUrl().includes("localhost")) {
+        console.warn("FRONTEND_BASE_URL not set; decision redirect will go to localhost.");
+      }
     });
   });
