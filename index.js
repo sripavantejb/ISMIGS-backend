@@ -4,11 +4,14 @@
  * Run from backend folder: npm run dev
  */
 import "dotenv/config";
+import crypto from "crypto";
 import express from "express";
 import cors from "cors";
 import nodemailer from "nodemailer";
 import jwt from "jsonwebtoken";
 import { MongoClient } from "mongodb";
+import { generateLinkedInPost } from "./services/energyLinkedIn.js";
+import { fetchCommodityStats, listCommodities } from "./services/energyData.js";
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -28,6 +31,9 @@ async function connectDb() {
   db = client.db(DB_NAME);
   await db.collection("admin_settings").createIndex({ key: 1 }, { unique: true }).catch(() => {});
   await db.collection("sector_recipients").createIndex({ sector_key: 1 }, { unique: true }).catch(() => {});
+  await db.collection("admin_decisions").createIndex({ token: 1 }, { unique: true }).catch(() => {});
+  await db.collection("admin_decisions").createIndex({ expires_at: 1 }).catch(() => {});
+  await db.collection("sector_alerts_log").createIndex({ commodity: 1, sector: 1, sent_at: 1 }).catch(() => {});
   return db;
 }
 
@@ -169,6 +175,114 @@ async function generateSectorSamplePost(sector_key, displayName) {
   const text = data.choices?.[0]?.message?.content?.trim();
   if (!text) throw new Error("OpenAI returned no content");
   return text;
+}
+
+// ---------- Energy disclosure: AdminDecisions, n8n, confirmation email ----------
+
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
+const CRON_SECRET = process.env.CRON_SECRET || "change-me-cron-secret";
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || process.env.VITE_APP_URL || "http://localhost:5173";
+
+function getDecisionRedirectUrl(result) {
+  const base = FRONTEND_BASE_URL.replace(/\/$/, "");
+  return `${base}/admin/decision?result=${result}`;
+}
+
+async function triggerN8nWebhook(decisionRecord) {
+  if (!N8N_WEBHOOK_URL) {
+    console.warn("N8N_WEBHOOK_URL not set; skipping webhook.");
+    return;
+  }
+  const payload = {
+    commodity: decisionRecord.commodity,
+    production: decisionRecord.production,
+    consumption: decisionRecord.consumption,
+    import_dependency: decisionRecord.import_dependency,
+    risk_score: decisionRecord.risk_score,
+    projected_deficit_year: decisionRecord.projected_deficit_year,
+    sector_impact: decisionRecord.sector_impact,
+    linkedin_post_text: decisionRecord.linkedin_post_text,
+    hashtags: decisionRecord.hashtags,
+    approved_at: decisionRecord.responded_at ? new Date(decisionRecord.responded_at).toISOString() : new Date().toISOString(),
+  };
+  const doPost = async () => {
+    const res = await fetch(N8N_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`n8n webhook ${res.status}: ${await res.text()}`);
+  };
+  try {
+    await doPost();
+  } catch (err) {
+    console.error("n8n webhook failed:", err.message);
+    try {
+      await doPost();
+    } catch (retryErr) {
+      console.error("n8n webhook retry failed:", retryErr.message);
+      throw retryErr;
+    }
+  }
+}
+
+async function sendConfirmationEmail(adminEmail, postData, transport, fromAddr) {
+  const database = getDb();
+  const token = crypto.randomUUID();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+  const decision = {
+    token,
+    commodity: postData.commodity,
+    linkedin_post_text: postData.linkedin_post_text,
+    hashtags: Array.isArray(postData.hashtags) ? postData.hashtags : [postData.hashtags].filter(Boolean),
+    status: "pending",
+    created_at: now,
+    expires_at: expiresAt,
+    responded_at: null,
+    production: postData.production,
+    consumption: postData.consumption,
+    import_dependency: postData.import_dependency,
+    risk_score: postData.risk_score,
+    projected_deficit_year: postData.projected_deficit_year,
+    sector_impact: postData.sector_impact,
+  };
+  if (database) {
+    await database.collection("admin_decisions").insertOne(decision);
+  }
+  const backendPublicUrl = (process.env.BACKEND_PUBLIC_URL || process.env.API_BASE_URL || "").replace(/\/$/, "") || `http://localhost:${process.env.PORT || 3001}`;
+  const approveLink = `${backendPublicUrl}/api/admin/decision?token=${token}&type=approve`;
+  const rejectLink = `${backendPublicUrl}/api/admin/decision?token=${token}&type=reject`;
+
+  const statsLines = postData.stats_summary
+    ? [
+        `Production: ${postData.stats_summary.production?.toLocaleString() ?? "—"}`,
+        `Consumption: ${postData.stats_summary.consumption?.toLocaleString() ?? "—"}`,
+        `Import dependency: ${postData.stats_summary.import_dependency_pct ?? "—"}%`,
+        `Risk score: ${postData.stats_summary.risk_score ?? "—"}`,
+        postData.stats_summary.projected_deficit_year ? `Projected deficit year: ${postData.stats_summary.projected_deficit_year}` : "",
+        postData.stats_summary.sector_impact ? `Sector impact: ${postData.stats_summary.sector_impact}` : "",
+      ].filter(Boolean)
+    : [];
+  const statsBlock = statsLines.length ? `\n\n--- Stats summary ---\n${statsLines.join("\n")}\n` : "";
+  const hashtagStr = Array.isArray(postData.hashtags) ? postData.hashtags.join(" ") : postData.hashtags || "";
+  const text =
+    `${postData.linkedin_post_text}\n${statsBlock}\nHashtags: ${hashtagStr}\n\n---\nDo you want to post this on LinkedIn?\nYes: ${approveLink}\nNo: ${rejectLink}`;
+  const html =
+    `<p style="white-space:pre-wrap;">${postData.linkedin_post_text.replace(/\n/g, "<br>")}</p>` +
+    (statsLines.length ? `<p><strong>Stats summary</strong><br>${statsLines.join("<br>")}</p>` : "") +
+    `<p>Hashtags: ${hashtagStr}</p>` +
+    `<p><strong>Do you want to post this on LinkedIn?</strong></p>` +
+    `<p><a href="${approveLink}" style="display:inline-block;margin-right:12px;padding:8px 16px;background:#0a66c2;color:#fff;text-decoration:none;border-radius:6px;">Yes</a> <a href="${rejectLink}" style="display:inline-block;padding:8px 16px;background:#6c757d;color:#fff;text-decoration:none;border-radius:6px;">No</a></p>`;
+
+  await transport.sendMail({
+    from: fromAddr,
+    to: adminEmail,
+    subject: `ISMIGS – Confirm LinkedIn post for ${postData.commodity}`,
+    text,
+    html,
+  });
+  return { token, expires_at: expiresAt };
 }
 
 // ---------- Auth (no requireAuth) ----------
@@ -711,6 +825,185 @@ app.post("/api/send-sector-email", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ---------- Energy disclosure: decision + send disclosure ----------
+
+app.get("/api/admin/decision", async (req, res) => {
+  const { token, type } = req.query || {};
+  const database = getDb();
+  if (!token || typeof token !== "string") {
+    return res.redirect(getDecisionRedirectUrl("expired"));
+  }
+  if (!database) {
+    return res.redirect(getDecisionRedirectUrl("expired"));
+  }
+  const doc = await database.collection("admin_decisions").findOne({ token });
+  if (!doc) {
+    console.warn("Admin decision: token not found", token);
+    return res.redirect(getDecisionRedirectUrl("expired"));
+  }
+  const now = new Date();
+  if (new Date(doc.expires_at) < now) {
+    return res.redirect(getDecisionRedirectUrl("expired"));
+  }
+  if (doc.status !== "pending") {
+    return res.redirect(getDecisionRedirectUrl(doc.status === "approved" ? "approved" : "rejected"));
+  }
+  const action = type === "approve" ? "approved" : type === "reject" ? "rejected" : null;
+  if (!action) {
+    return res.redirect(getDecisionRedirectUrl("expired"));
+  }
+  await database.collection("admin_decisions").updateOne(
+    { token },
+    { $set: { status: action === "approved" ? "approved" : "rejected", responded_at: now } }
+  );
+  if (action === "approved") {
+    try {
+      const updated = await database.collection("admin_decisions").findOne({ token });
+      await triggerN8nWebhook(updated || doc);
+    } catch (err) {
+      console.error("n8n webhook error after approval:", err.message);
+    }
+  }
+  return res.redirect(getDecisionRedirectUrl(action === "approved" ? "approved" : "rejected"));
+});
+
+app.get("/api/energy-commodities", async (_req, res) => {
+  try {
+    const list = await listCommodities();
+    res.json(list);
+  } catch (e) {
+    res.status(502).json({ error: e.message || "Failed to fetch commodities." });
+  }
+});
+
+app.post("/api/send-energy-disclosure", async (req, res) => {
+  const { commodity, adminEmail } = req.body || {};
+  const email = typeof adminEmail === "string" ? adminEmail.trim() : "";
+  const commodityName = typeof commodity === "string" ? commodity.trim() : null;
+  if (!email) {
+    return res.status(400).json({ error: "adminEmail is required." });
+  }
+  const settings = await getSettings();
+  if (settings.notifications_enabled === false) {
+    return res.status(503).json({ error: "Notifications are disabled in admin settings." });
+  }
+  let transport, fromAddr;
+  if (smtpHost && smtpUser && smtpPass) {
+    fromAddr = getFrom(settings);
+    transport = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpPort === 465,
+      auth: { user: smtpUser, pass: smtpPass },
+    });
+  } else {
+    const ethereal = await createEtherealTransport();
+    transport = ethereal.transport;
+    fromAddr = ethereal.fromAddr;
+  }
+  try {
+    const commodityToUse = commodityName || (await listCommodities()).then((c) => c[0]).catch(() => null);
+    if (!commodityToUse) {
+      return res.status(400).json({ error: "No commodity specified and no energy data available." });
+    }
+    const postData = await generateLinkedInPost(commodityToUse);
+    await sendConfirmationEmail(email, postData, transport, fromAddr);
+    res.json({
+      ok: true,
+      message: "Confirmation email sent. Check your inbox and use Yes/No to approve or reject the LinkedIn post.",
+      commodity: commodityToUse,
+    });
+  } catch (e) {
+    console.error("send-energy-disclosure error:", e.message);
+    res.status(500).json({ error: e.message || "Failed to send energy disclosure." });
+  }
+});
+
+// ---------- Cron: sector critical alerts (every 6h) ----------
+
+const RISK_THRESHOLD = Number(process.env.ENERGY_RISK_THRESHOLD) || 40;
+
+app.get("/api/cron/sector-critical-alerts", async (req, res) => {
+  const secret = req.headers.authorization?.replace(/^Bearer\s+/i, "") || req.query?.secret || "";
+  if (secret !== CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized." });
+  }
+  const database = getDb();
+  if (!database) {
+    return res.status(503).json({ error: "MongoDB not configured." });
+  }
+  let commodities;
+  try {
+    commodities = await listCommodities();
+  } catch (e) {
+    return res.status(502).json({ error: "Failed to fetch commodities: " + e.message });
+  }
+  const results = [];
+  let transport, fromAddr;
+  const settings = await getSettings();
+  if (smtpHost && smtpUser && smtpPass) {
+    fromAddr = getFrom(settings);
+    transport = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpPort === 465,
+      auth: { user: smtpUser, pass: smtpPass },
+    });
+  } else {
+    try {
+      const ethereal = await createEtherealTransport();
+      transport = ethereal.transport;
+      fromAddr = ethereal.fromAddr;
+    } catch (e) {
+      return res.status(503).json({ error: "No SMTP or Ethereal available." });
+    }
+  }
+  const slugify = (s) => String(s).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+  for (const commodityName of commodities) {
+    let stats;
+    try {
+      stats = await fetchCommodityStats(commodityName);
+    } catch (e) {
+      continue;
+    }
+    const isCritical = stats.riskScore >= RISK_THRESHOLD || (stats.projectedDeficitYear != null);
+    if (!isCritical) continue;
+    const sectorKey = `energy:${slugify(commodityName)}`;
+    const row = await database.collection("sector_recipients").findOne({ sector_key: sectorKey, enabled: true });
+    const recipients = row?.emails || [];
+    if (recipients.length === 0) continue;
+    const topSectors = stats.topSectors || [];
+    const reason = stats.riskReasons?.length ? stats.riskReasons.join("; ") : "Risk or projected deficit.";
+    for (const sec of topSectors) {
+      const alertHtml = `<p><strong>Sector:</strong> ${sec.name}</p><p><strong>% consumption share:</strong> ${sec.sharePct.toFixed(1)}%</p><p><strong>Risk reason:</strong> ${reason}</p><p><strong>Commodity:</strong> ${commodityName}</p><p>Recommended: Monitor supply-demand and consider mitigation per ISMIGS dashboard.</p>`;
+      const alertText = `Sector: ${sec.name}. % consumption share: ${sec.sharePct.toFixed(1)}%. Risk reason: ${reason}. Commodity: ${commodityName}. Recommended: Monitor supply-demand and consider mitigation per ISMIGS dashboard.`;
+      try {
+        const sentAt = new Date();
+        for (const to of recipients) {
+          await transport.sendMail({
+            from: fromAddr,
+            to,
+            subject: `ISMIGS – Critical alert: ${commodityName} (${sec.name})`,
+            text: alertText,
+            html: alertHtml,
+          });
+        }
+        await database.collection("sector_alerts_log").insertOne({
+          commodity: commodityName,
+          sector: sec.name,
+          risk_score: stats.riskScore,
+          sent_at: sentAt,
+          alert_type: stats.projectedDeficitYear ? "projected_deficit" : "risk_threshold",
+        });
+        results.push({ commodity: commodityName, sector: sec.name, sent: recipients.length });
+      } catch (e) {
+        console.error("Alert send failed:", e.message);
+      }
+    }
+  }
+  res.json({ ok: true, results });
 });
 
 app.post("/api/send-email", async (req, res) => {
