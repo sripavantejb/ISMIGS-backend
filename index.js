@@ -732,6 +732,86 @@ app.post("/api/superadmin/send-sector-email", requireSuperAdmin, async (req, res
   }
 });
 
+app.get("/api/superadmin/notifications", requireSuperAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+  const sectorIdParam = req.query.sector_id;
+  let sectorFilter = null;
+  if (sectorIdParam && typeof sectorIdParam === "string") {
+    try {
+      sectorFilter = new ObjectId(sectorIdParam);
+    } catch (_) {}
+  }
+  try {
+    const items = [];
+    const lpFilter = sectorFilter ? { sector_id: sectorFilter } : {};
+    const posts = await database.collection("linkedin_posts").find(lpFilter).sort({ created_at: -1 }).limit(limit).toArray();
+    const sectorIdsFromPosts = [...new Set(posts.map((p) => p.sector_id?.toString()).filter(Boolean))];
+    const auditFilter = sectorFilter ? { sector_id: sectorFilter.toString() } : {};
+    const audits = await database.collection("audit_logs").find(auditFilter).sort({ timestamp: -1 }).limit(limit).toArray();
+    const sectorIdsFromAudits = [...new Set(audits.map((a) => a.sector_id && (typeof a.sector_id === "string" ? a.sector_id : a.sector_id.toString())).filter(Boolean))];
+    const allSectorIds = [...new Set([...sectorIdsFromPosts, ...sectorIdsFromAudits])];
+    let sectorMap = {};
+    if (allSectorIds.length > 0) {
+      const oids = allSectorIds.map((id) => {
+        try { return new ObjectId(id); } catch { return null; }
+      }).filter(Boolean);
+      const sectors = await database.collection("sectors").find({ _id: { $in: oids } }).toArray();
+      sectorMap = Object.fromEntries(sectors.map((s) => [s._id.toString(), s.sector_name]));
+    }
+    for (const d of posts) {
+      const sector_id = d.sector_id ? d.sector_id.toString() : null;
+      const sector_name = sector_id ? (sectorMap[sector_id] || null) : null;
+      const timestamp = d.approved_at || d.created_at;
+      let title = "LinkedIn post created";
+      if (d.status === "approved") title = "Post approved";
+      else if (d.status === "rejected") title = "Post rejected";
+      items.push({
+        type: "linkedin_post",
+        id: d._id.toString(),
+        sector_id,
+        sector_name,
+        title,
+        description: d.commodity ? `Commodity: ${d.commodity}. Status: ${d.status}` : `Status: ${d.status}`,
+        timestamp: timestamp ? new Date(timestamp).toISOString() : null,
+        meta: { commodity: d.commodity, status: d.status },
+      });
+    }
+    for (const a of audits) {
+      const sector_id = a.sector_id ? (typeof a.sector_id === "string" ? a.sector_id : a.sector_id.toString()) : null;
+      const sector_name = sector_id ? (sectorMap[sector_id] || null) : null;
+      const actionLabels = {
+        create_sector: "Sector created",
+        create_sector_admin: "Sector admin created",
+        send_sector_email: "Email sent to sector",
+        approve_post: "Post approved",
+        reject_post: "Post rejected",
+      };
+      const title = actionLabels[a.action] || a.action || "Activity";
+      items.push({
+        type: "audit",
+        id: a._id.toString(),
+        sector_id,
+        sector_name,
+        title,
+        description: sector_name ? `Sector: ${sector_name}` : "",
+        timestamp: a.timestamp ? new Date(a.timestamp).toISOString() : null,
+        meta: a.meta || null,
+      });
+    }
+    items.sort((a, b) => {
+      const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+      const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+      return tb - ta;
+    });
+    const limited = items.slice(0, limit);
+    res.json({ items: limited });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- Sector Admin (requireSectorAdmin: users with sector_id, or legacy sector_key) ----------
 
 app.get("/api/sector-admin/posts", requireSectorAdmin, async (req, res) => {
