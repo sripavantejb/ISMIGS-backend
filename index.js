@@ -334,9 +334,11 @@ app.get("/api/auth/me", (req, res) => {
 // ---------- OpenAI proxy (for frontend Predictions / GVA impact) ----------
 
 app.post("/api/openai/v1/chat/completions", async (req, res) => {
-  const key = process.env.OPENAI_API_KEY;
+  const key = (OPENAI_API_KEY || "").trim();
   if (!key) {
-    return res.status(503).json({ error: "OpenAI API key not configured." });
+    return res.status(503).json({
+      error: "OpenAI API key not configured. Set OPENAI_API_KEY in Vercel (Settings → Environment Variables) and redeploy the backend.",
+    });
   }
   const body = req.body && typeof req.body === "object" ? req.body : {};
   try {

@@ -4,8 +4,6 @@
 
 import { fetchCommodityStats } from "./energyData.js";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
 function extractHashtags(text) {
   const tags = [];
   const re = /#[\w]+/g;
@@ -51,7 +49,8 @@ export async function generateLinkedInPost(commodityId) {
     sector_impact: sectorImpact,
   };
 
-  if (!OPENAI_API_KEY) {
+  const openaiKey = (process.env.OPENAI_API_KEY || "").trim();
+  if (!openaiKey) {
     throw new Error("OPENAI_API_KEY required for LinkedIn post generation.");
   }
 
@@ -85,7 +84,7 @@ export async function generateLinkedInPost(commodityId) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${openaiKey}`,
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
