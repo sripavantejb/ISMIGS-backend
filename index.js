@@ -395,7 +395,7 @@ async function triggerN8nWebhook(decisionRecord) {
   }
 }
 
-async function sendConfirmationEmail(adminEmail, postData, transport, fromAddr) {
+async function sendConfirmationEmail(adminEmail, postData, transport, fromAddr, includeSectorPanelNote = false) {
   const database = getDb();
   const token = crypto.randomUUID();
   const now = new Date();
@@ -434,11 +434,14 @@ async function sendConfirmationEmail(adminEmail, postData, transport, fromAddr) 
       ].filter(Boolean)
     : [];
   const statsBlock = statsLines.length ? `\n\n--- Stats summary ---\n${statsLines.join("\n")}\n` : "";
-  const text = `${postData.linkedin_post_text}\n${statsBlock}` + confirmTextSuffix;
+  const sectorPanelNoteText = includeSectorPanelNote ? "\n\nThis post was also added to the sector admin panel for approval. Once the sector admin approves there, the LinkedIn content will be sent to the configured webhook." : "";
+  const sectorPanelNoteHtml = includeSectorPanelNote ? "<p><em>This post was also added to the sector admin panel for approval. Once the sector admin approves there, the LinkedIn content will be sent to the configured webhook.</em></p>" : "";
+  const text = `${postData.linkedin_post_text}\n${statsBlock}` + confirmTextSuffix + sectorPanelNoteText;
   const html =
     `<p style="white-space:pre-wrap;">${postData.linkedin_post_text.replace(/\n/g, "<br>")}</p>` +
     (statsLines.length ? `<p><strong>Stats summary</strong><br>${statsLines.join("<br>")}</p>` : "") +
-    confirmHtmlSuffix;
+    confirmHtmlSuffix +
+    sectorPanelNoteHtml;
 
   await transport.sendMail({
     from: fromAddr,
@@ -1792,9 +1795,11 @@ const OPENAI_KEY_REQUIRED_MSG =
   "OpenAI API key not configured. Set OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN in Vercel (ismigs-backend → Settings → Environment Variables) and redeploy.";
 
 app.post("/api/send-energy-disclosure", async (req, res) => {
-  const { commodity, adminEmail } = req.body || {};
+  const { commodity, adminEmail, sector_key: bodySectorKey, sector_name: bodySectorName } = req.body || {};
   const email = typeof adminEmail === "string" ? adminEmail.trim() : "";
   const commodityName = typeof commodity === "string" ? commodity.trim() : null;
+  const sectorKey = typeof bodySectorKey === "string" ? bodySectorKey.trim() : "";
+  const sectorNameForEnsure = typeof bodySectorName === "string" ? bodySectorName.trim() : "";
   if (!email) {
     return res.status(400).json({ error: "adminEmail is required." });
   }
@@ -1840,11 +1845,44 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
   }
   try {
     const postData = await generateLinkedInPost(commodityToUse);
-    await sendConfirmationEmail(email, postData, transport, fromAddr);
+    let sectorIdForPost = null;
+    if (sectorKey) {
+      const database = getDb();
+      if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+      let sector = await database.collection("sectors").findOne({ sector_key: sectorKey });
+      if (!sector) {
+        const sectorNameFinal = sectorNameForEnsure || sectorKey;
+        const doc = { sector_name: sectorNameFinal, sector_key: sectorKey, created_at: new Date() };
+        const result = await database.collection("sectors").insertOne(doc);
+        sector = { _id: result.insertedId, ...doc };
+      }
+      sectorIdForPost = sector._id;
+      const now = new Date();
+      const lp = {
+        sector_id: sectorIdForPost,
+        sector_key: sectorKey,
+        commodity: postData.commodity,
+        post_content: postData.linkedin_post_text,
+        hashtags: Array.isArray(postData.hashtags) ? postData.hashtags : [postData.hashtags].filter(Boolean),
+        status: "pending",
+        created_at: now,
+        production: postData.production,
+        consumption: postData.consumption,
+        import_dependency: postData.import_dependency,
+        risk_score: postData.risk_score,
+        projected_deficit_year: postData.projected_deficit_year,
+        sector_impact: postData.sector_impact,
+      };
+      await database.collection("linkedin_posts").insertOne(lp);
+    }
+    await sendConfirmationEmail(email, postData, transport, fromAddr, sectorKey ? true : false);
     res.json({
       ok: true,
-      message: "Confirmation email sent. Check your inbox and use Yes/No to approve or reject the LinkedIn post.",
+      message: sectorKey
+        ? "Confirmation email sent and post added to sector approvals. Sector admin can approve from the sector panel; then the LinkedIn content will be sent to the webhook."
+        : "Confirmation email sent. Check your inbox and use Yes/No to approve or reject the LinkedIn post.",
       commodity: commodityToUse,
+      sector_approval_created: !!sectorKey,
     });
   } catch (e) {
     const msg = e.message || "";
