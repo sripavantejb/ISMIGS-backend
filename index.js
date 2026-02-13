@@ -539,15 +539,18 @@ app.get("/api/auth/me", async (req, res) => {
     if (!database) return res.json({ user: payload.sub });
     const user = await database.collection("users").findOne({ _id: new ObjectId(payload.sub) });
     if (!user) return res.json({ user: payload.sub });
-    return res.json({
-      user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        sector_id: user.sector_id ? user.sector_id.toString() : null,
-      },
-    });
+    const userPayload = {
+      id: user._id.toString(),
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      sector_id: user.sector_id ? user.sector_id.toString() : null,
+    };
+    if (user.sector_id) {
+      const sector = await database.collection("sectors").findOne({ _id: user.sector_id });
+      if (sector) userPayload.sector_name = sector.sector_name || sector.sector_key || null;
+    }
+    return res.json({ user: userPayload });
   } catch {
     return res.json({ user: null });
   }
@@ -900,31 +903,44 @@ app.get("/api/sector-admin/posts", requireSectorAdmin, async (req, res) => {
   }
 });
 
-function triggerN8nWebhookForLinkedInPost(postRecord, sectorName, approvedBy, approvedAt) {
+async function triggerN8nWebhookForLinkedInPost(postRecord, sectorName, approvedBy, approvedAt) {
   if (!N8N_WEBHOOK_URL) {
     console.warn("N8N_WEBHOOK_URL not set; skipping webhook.");
-    return Promise.resolve();
+    return;
   }
   const payload = {
-    sector_name: sectorName || postRecord.sector_name || "",
     commodity: postRecord.commodity,
     production: postRecord.production,
     consumption: postRecord.consumption,
     import_dependency: postRecord.import_dependency,
     risk_score: postRecord.risk_score,
     projected_deficit_year: postRecord.projected_deficit_year,
-    linkedin_post_content: postRecord.post_content,
+    sector_impact: postRecord.sector_impact ?? null,
+    linkedin_post_text: postRecord.post_content,
     hashtags: postRecord.hashtags || [],
-    approved_by: approvedBy,
     approved_at: approvedAt ? new Date(approvedAt).toISOString() : new Date().toISOString(),
+    sector_name: sectorName || postRecord.sector_name || "",
+    approved_by: approvedBy,
   };
-  return fetch(N8N_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  }).then((res) => {
-    if (!res.ok) throw new Error(`n8n webhook ${res.status}: ${res.statusText}`);
-  });
+  const doPost = async () => {
+    const res = await fetch(N8N_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`n8n webhook ${res.status}: ${await res.text()}`);
+  };
+  try {
+    await doPost();
+  } catch (err) {
+    console.error("n8n webhook failed after sector approval:", err.message);
+    try {
+      await doPost();
+    } catch (retryErr) {
+      console.error("n8n webhook retry failed after sector approval:", retryErr.message);
+      throw retryErr;
+    }
+  }
 }
 
 app.post("/api/sector-admin/decision", requireSectorAdmin, async (req, res) => {
@@ -950,6 +966,7 @@ app.post("/api/sector-admin/decision", requireSectorAdmin, async (req, res) => {
   }
   await database.collection("linkedin_posts").updateOne({ _id: oid }, { $set: update });
   await insertAuditLog(database, { user_id: req.user.id, action: decision === "approve" ? "approve_post" : "reject_post", sector_id: post.sector_id?.toString(), meta: { post_id } });
+  let webhookSent = false;
   if (decision === "approve") {
     let sectorName = "";
     if (post.sector_id) {
@@ -958,11 +975,12 @@ app.post("/api/sector-admin/decision", requireSectorAdmin, async (req, res) => {
         }
     try {
       await triggerN8nWebhookForLinkedInPost(post, sectorName, req.user.id, now);
+      webhookSent = true;
     } catch (err) {
       console.error("n8n webhook error after sector approval:", err.message);
     }
   }
-  res.json({ ok: true, status: newStatus });
+  res.json({ ok: true, status: newStatus, webhook_sent: webhookSent });
 });
 
 // ---------- OpenAI proxy (for frontend Predictions / GVA impact) ----------
