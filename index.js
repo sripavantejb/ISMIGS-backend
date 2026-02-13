@@ -12,7 +12,9 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
 import { MongoClient, ObjectId } from "mongodb";
 import { generateLinkedInPost } from "./services/energyLinkedIn.js";
+import { generateSectorLinkedInPost } from "./services/sectorLinkedIn.js";
 import { fetchCommodityStats, listCommodities } from "./services/energyData.js";
+import { insertAuditLog } from "./services/auditLog.js";
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -21,6 +23,8 @@ app.use(express.json());
 const JWT_SECRET = process.env.JWT_SECRET || "ismigs-dev-secret-change-in-production";
 const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || "admin").trim();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+const SUPER_ADMIN_EMAIL = (process.env.SUPER_ADMIN_EMAIL || "").trim();
+const SUPER_ADMIN_PASSWORD = (process.env.SUPER_ADMIN_PASSWORD || "").trim();
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://myselfyourstej_db_user:ismigs@cluster0.eq96ml6.mongodb.net/?appName=Cluster0";
 
 let db = null;
@@ -37,6 +41,30 @@ async function connectDb() {
   await db.collection("admin_decisions").createIndex({ expires_at: 1 }).catch(() => {});
   await db.collection("admin_decisions").createIndex({ sector_key: 1 }).catch(() => {});
   await db.collection("sector_alerts_log").createIndex({ commodity: 1, sector: 1, sent_at: 1 }).catch(() => {});
+  await db.collection("sectors").createIndex({ sector_key: 1 }, { unique: true, sparse: true }).catch(() => {});
+  await db.collection("users").createIndex({ email: 1 }, { unique: true }).catch(() => {});
+  await db.collection("users").createIndex({ role: 1 }).catch(() => {});
+  await db.collection("linkedin_posts").createIndex({ sector_id: 1 }).catch(() => {});
+  await db.collection("linkedin_posts").createIndex({ status: 1 }).catch(() => {});
+  await db.collection("linkedin_posts").createIndex({ created_at: -1 }).catch(() => {});
+  await db.collection("audit_logs").createIndex({ user_id: 1, timestamp: -1 }).catch(() => {});
+  await db.collection("audit_logs").createIndex({ timestamp: -1 }).catch(() => {});
+
+  if (SUPER_ADMIN_EMAIL && SUPER_ADMIN_PASSWORD) {
+    const usersCol = db.collection("users");
+    const count = await usersCol.countDocuments();
+    if (count === 0) {
+      const password_hash = await bcrypt.hash(SUPER_ADMIN_PASSWORD, 10);
+      await usersCol.insertOne({
+        name: "Super Admin",
+        email: SUPER_ADMIN_EMAIL,
+        password_hash,
+        role: "SUPER_ADMIN",
+        sector_id: null,
+        created_at: new Date(),
+      });
+    }
+  }
   return db;
 }
 
@@ -72,6 +100,47 @@ function requireSectorAuth(req, res, next) {
     }
     req.sectorKey = payload.sub;
     next();
+  } catch {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+}
+
+async function requireSuperAdmin(req, res, next) {
+  const auth = req.headers.authorization;
+  const token = auth && auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.sub === "admin") {
+      req.user = { id: "admin", role: "SUPER_ADMIN", sector_id: null };
+      return next();
+    }
+    const database = getDb();
+    if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+    const user = await database.collection("users").findOne({ _id: new ObjectId(payload.sub) });
+    if (!user || user.role !== "SUPER_ADMIN") return res.status(403).json({ error: "Forbidden" });
+    req.user = { id: user._id.toString(), role: user.role, sector_id: null };
+    next();
+  } catch {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+}
+
+async function requireSectorAdmin(req, res, next) {
+  const auth = req.headers.authorization;
+  const token = auth && auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.role === "SECTOR_ADMIN" && payload.sector_id) {
+      req.user = { id: payload.sub, sector_id: payload.sector_id };
+      return next();
+    }
+    if (payload.role === "sector" && payload.sub) {
+      req.user = { id: payload.sub, sectorKey: payload.sub };
+      return next();
+    }
+    return res.status(403).json({ error: "Forbidden" });
   } catch {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -381,21 +450,48 @@ async function sendConfirmationEmail(adminEmail, postData, transport, fromAddr) 
   return { token, expires_at: expiresAt };
 }
 
-// ---------- Auth (no requireAuth) ----------
+// ---------- Auth (unified login: email from users, or legacy username for admin) ----------
 
 app.post("/api/auth/login", async (req, res) => {
-  const { username, password } = req.body || {};
+  const { email, password, username } = req.body || {};
+  const emailTrimmed = typeof email === "string" ? email.trim().toLowerCase() : "";
   const u = typeof username === "string" ? username.trim() : "";
   const p = typeof password === "string" ? password : "";
-  if (u === ADMIN_USERNAME && p === ADMIN_PASSWORD) {
+  const database = getDb();
+
+  if (emailTrimmed && p) {
+    if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+    const user = await database.collection("users").findOne({ email: emailTrimmed });
+    if (user && user.password_hash) {
+      const match = await bcrypt.compare(p, user.password_hash);
+      if (match) {
+        const sub = user._id.toString();
+        const role = user.role || "SECTOR_ADMIN";
+        const sector_id = user.sector_id ? user.sector_id.toString() : null;
+        const token = jwt.sign(
+          { sub, role, sector_id, iat: Math.floor(Date.now() / 1000) },
+          JWT_SECRET,
+          { expiresIn: "7d" }
+        );
+        return res.json({
+          token,
+          role,
+          sector_id: sector_id || undefined,
+          user: { id: sub, name: user.name, email: user.email, role, sector_id: sector_id || undefined },
+        });
+      }
+    }
+  }
+
+  if (u && p && u === ADMIN_USERNAME && p === ADMIN_PASSWORD) {
     const token = jwt.sign(
-      { sub: "admin", iat: Math.floor(Date.now() / 1000) },
+      { sub: "admin", role: "SUPER_ADMIN", iat: Math.floor(Date.now() / 1000) },
       JWT_SECRET,
       { expiresIn: "7d" }
     );
-    return res.json({ token });
+    return res.json({ token, role: "SUPER_ADMIN", user: { id: "admin", role: "SUPER_ADMIN" } });
   }
-  return res.status(401).json({ error: "Invalid username or password." });
+  return res.status(401).json({ error: "Invalid email/username or password." });
 });
 
 app.post("/api/auth/sector-login", async (req, res) => {
@@ -429,8 +525,311 @@ app.post("/api/auth/sector-login", async (req, res) => {
 // Auth skipped for now – no JWT required on /api routes
 // app.use("/api", requireAuth);
 
-app.get("/api/auth/me", (req, res) => {
-  res.json({ user: req.user || "admin" });
+app.get("/api/auth/me", async (req, res) => {
+  const auth = req.headers.authorization;
+  const token = auth && auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.json({ user: null });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.sub === "admin") return res.json({ user: "admin", role: "SUPER_ADMIN" });
+    const database = getDb();
+    if (!database) return res.json({ user: payload.sub });
+    const user = await database.collection("users").findOne({ _id: new ObjectId(payload.sub) });
+    if (!user) return res.json({ user: payload.sub });
+    return res.json({
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        sector_id: user.sector_id ? user.sector_id.toString() : null,
+      },
+    });
+  } catch {
+    return res.json({ user: null });
+  }
+});
+
+// ---------- Super Admin (requireSuperAdmin) ----------
+
+app.post("/api/superadmin/create-sector", requireSuperAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const { sector_name, sector_key: bodySectorKey } = req.body || {};
+  const name = typeof sector_name === "string" ? sector_name.trim() : "";
+  if (!name) return res.status(400).json({ error: "sector_name is required." });
+  const sector_key = typeof bodySectorKey === "string" && bodySectorKey.trim()
+    ? bodySectorKey.trim()
+    : "energy:" + slugifyCommodity(name);
+  try {
+    const existing = await database.collection("sectors").findOne({ $or: [{ sector_name: name }, { sector_key }] });
+    if (existing) return res.status(400).json({ error: "Sector with this name or key already exists." });
+    const doc = { sector_name: name, sector_key, created_at: new Date() };
+    const result = await database.collection("sectors").insertOne(doc);
+    await insertAuditLog(database, { user_id: req.user?.id, action: "create_sector", meta: { sector_id: result.insertedId.toString(), sector_name: name } });
+    res.status(201).json({ id: result.insertedId.toString(), sector_name: name, sector_key, created_at: doc.created_at });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/superadmin/create-sector-admin", requireSuperAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const { name, email, password, sector_id } = req.body || {};
+  const userName = typeof name === "string" ? name.trim() : "";
+  const emailTrimmed = typeof email === "string" ? email.trim().toLowerCase() : "";
+  const p = typeof password === "string" ? password : "";
+  if (!userName || !emailTrimmed || !p) return res.status(400).json({ error: "name, email, and password are required." });
+  if (!sector_id) return res.status(400).json({ error: "sector_id is required." });
+  let sectorOid;
+  try { sectorOid = new ObjectId(sector_id); } catch { return res.status(400).json({ error: "Invalid sector_id." }); }
+  const sector = await database.collection("sectors").findOne({ _id: sectorOid });
+  if (!sector) return res.status(400).json({ error: "Sector not found." });
+  const existing = await database.collection("users").findOne({ email: emailTrimmed });
+  if (existing) return res.status(400).json({ error: "Email already registered." });
+  try {
+    const password_hash = await bcrypt.hash(p, 10);
+    const doc = { name: userName, email: emailTrimmed, password_hash, role: "SECTOR_ADMIN", sector_id: sectorOid, created_at: new Date() };
+    const result = await database.collection("users").insertOne(doc);
+    await insertAuditLog(database, { user_id: req.user?.id, action: "create_sector_admin", sector_id: sector_id, meta: { user_id: result.insertedId.toString(), email: emailTrimmed } });
+    res.status(201).json({ id: result.insertedId.toString(), name: userName, email: emailTrimmed, role: "SECTOR_ADMIN", sector_id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/superadmin/sectors", requireSuperAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  try {
+    const list = await database.collection("sectors").find({}).sort({ created_at: -1 }).toArray();
+    const sectorIds = list.map((d) => d._id);
+    const admins = await database.collection("users").find({ role: "SECTOR_ADMIN", sector_id: { $in: sectorIds } }).project({ sector_id: 1 }).toArray();
+    const sectorsWithAdmin = new Set(admins.map((a) => a.sector_id && a.sector_id.toString()).filter(Boolean));
+    res.json(list.map((d) => ({
+      id: d._id.toString(),
+      sector_name: d.sector_name,
+      sector_key: d.sector_key,
+      created_at: d.created_at ? new Date(d.created_at).toISOString() : null,
+      has_sector_admin: sectorsWithAdmin.has(d._id.toString()),
+    })));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/superadmin/all-approvals", requireSuperAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  const offset = parseInt(req.query.offset, 10) || 0;
+  const sector_id = req.query.sector_id;
+  const commodity = req.query.commodity;
+  const status = req.query.status;
+  try {
+    const filter = {};
+    if (sector_id) filter.sector_id = new ObjectId(sector_id);
+    if (commodity) filter.commodity = commodity;
+    if (status && ["pending", "approved", "rejected"].includes(status)) filter.status = status;
+    const cursor = database.collection("linkedin_posts").find(filter).sort({ created_at: -1 }).skip(offset).limit(limit);
+    const items = await cursor.toArray();
+    const sectorIds = [...new Set(items.map((i) => i.sector_id?.toString()).filter(Boolean))];
+    const sectors = sectorIds.length ? await database.collection("sectors").find({ _id: { $in: items.map((i) => i.sector_id).filter(Boolean) } }).toArray() : [];
+    const sectorMap = Object.fromEntries(sectors.map((s) => [s._id.toString(), s.sector_name]));
+    const total = await database.collection("linkedin_posts").countDocuments(filter);
+    const out = items.map((d) => ({
+      id: d._id.toString(),
+      sector_id: d.sector_id?.toString(),
+      sector_name: sectorMap[d.sector_id?.toString()] || null,
+      commodity: d.commodity,
+      post_content: d.post_content,
+      hashtags: d.hashtags || [],
+      status: d.status || "pending",
+      created_at: d.created_at ? new Date(d.created_at).toISOString() : null,
+      approved_at: d.approved_at ? new Date(d.approved_at).toISOString() : null,
+      approved_by: d.approved_by,
+    }));
+    res.json({ items: out, total });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/superadmin/send-sector-email", requireSuperAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const { sector_id } = req.body || {};
+  if (!sector_id) return res.status(400).json({ error: "sector_id is required." });
+  let sectorOid;
+  try { sectorOid = new ObjectId(sector_id); } catch { return res.status(400).json({ error: "Invalid sector_id." }); }
+  const sector = await database.collection("sectors").findOne({ _id: sectorOid });
+  if (!sector) return res.status(400).json({ error: "Sector not found." });
+  const sector_key = sector.sector_key || "energy:" + slugifyCommodity(sector.sector_name);
+  const sector_name = sector.sector_name || sector_key;
+  const recip = await database.collection("sector_recipients").findOne({ sector_key });
+  const emails = recip && recip.enabled !== false ? (recip.emails || []).filter(Boolean) : [];
+  if (emails.length === 0) return res.status(400).json({ error: "No recipients for this sector. Add emails in Sector recipients." });
+  const settings = await getSettings();
+  if (settings.notifications_enabled === false) return res.status(503).json({ error: "Notifications are disabled." });
+  let transport, fromAddr;
+  if (smtpHost && smtpUser && smtpPass) {
+    fromAddr = getFrom(settings);
+    transport = nodemailer.createTransport({ host: smtpHost, port: smtpPort, secure: smtpPort === 465, auth: { user: smtpUser, pass: smtpPass } });
+  } else {
+    const ethereal = await createEtherealTransport();
+    transport = ethereal.transport;
+    fromAddr = ethereal.fromAddr;
+  }
+  try {
+    const postData = await generateSectorLinkedInPost({ sector_name, sector_key });
+    const now = new Date();
+    const lp = {
+      sector_id: sectorOid,
+      sector_key,
+      commodity: postData.commodity,
+      post_content: postData.post_content,
+      hashtags: postData.hashtags || [],
+      status: "pending",
+      created_at: now,
+      production: postData.production,
+      consumption: postData.consumption,
+      import_dependency: postData.import_dependency,
+      risk_score: postData.risk_score,
+      projected_deficit_year: postData.projected_deficit_year,
+      sector_impact: postData.sector_impact,
+    };
+    const { insertedId } = await database.collection("linkedin_posts").insertOne(lp);
+    const frontendUrl = (getFrontendBaseUrl() || "").replace(/\/$/, "");
+    const approvalsUrl = frontendUrl ? `${frontendUrl}/sector/approvals` : "#";
+    const statsLines = [
+      `Production: ${(postData.production ?? "").toLocaleString?.() ?? postData.production}`,
+      `Consumption: ${(postData.consumption ?? "").toLocaleString?.() ?? postData.consumption}`,
+      `Import dependency: ${postData.import_dependency ?? "—"}%`,
+      `Risk score: ${postData.risk_score ?? "—"}`,
+      postData.projected_deficit_year ? `Projected deficit year: ${postData.projected_deficit_year}` : "",
+    ].filter(Boolean);
+    const subject = `ISMIGS – Sector: ${sector_name} – Commodity impact: ${postData.commodity}`;
+    const text =
+      `Sector: ${sector_name}\nCommodity Impact: ${postData.commodity}\n\n${postData.post_content}\n\n---\n${statsLines.join("\n")}\n\nReview and approve: ${approvalsUrl}`;
+    const html =
+      `<p><strong>Sector:</strong> ${sector_name}</p><p><strong>Commodity Impact:</strong> ${postData.commodity}</p>` +
+      `<p style="white-space:pre-wrap;">${(postData.post_content || "").replace(/\n/g, "<br>")}</p>` +
+      `<p><strong>Stats</strong><br>${statsLines.join("<br>")}</p>` +
+      `<p><a href="${approvalsUrl}" style="display:inline-block;padding:8px 16px;background:#0a66c2;color:#fff;text-decoration:none;border-radius:6px;">Open sector approvals</a></p>`;
+    for (const to of emails) {
+      try {
+        await transport.sendMail({ from: fromAddr, to, subject, text, html });
+        await insertEmailLog(sector_key, to, subject, true, null);
+      } catch (err) {
+        await insertEmailLog(sector_key, to, subject, false, err.message);
+      }
+    }
+    await insertAuditLog(database, { user_id: req.user?.id, action: "send_sector_email", sector_id, meta: { post_id: insertedId.toString() } });
+    res.json({ ok: true, post_id: insertedId.toString(), sent: emails.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Sector Admin (requireSectorAdmin: users with sector_id, or legacy sector_key) ----------
+
+app.get("/api/sector-admin/posts", requireSectorAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const sector_id = req.user.sector_id;
+  const sectorKey = req.user.sectorKey;
+  const status = req.query.status;
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  try {
+    const filter = sector_id ? { sector_id: new ObjectId(sector_id) } : { sector_key: sectorKey };
+    if (status && ["pending", "approved", "rejected"].includes(status)) filter.status = status;
+    const items = await database.collection("linkedin_posts").find(filter).sort({ created_at: -1 }).limit(limit).toArray();
+    res.json({
+      items: items.map((d) => ({
+        id: d._id.toString(),
+        sector_id: d.sector_id?.toString(),
+        commodity: d.commodity,
+        post_content: d.post_content,
+        hashtags: d.hashtags || [],
+        status: d.status || "pending",
+        created_at: d.created_at ? new Date(d.created_at).toISOString() : null,
+        approved_at: d.approved_at ? new Date(d.approved_at).toISOString() : null,
+        production: d.production,
+        consumption: d.consumption,
+        import_dependency: d.import_dependency,
+        risk_score: d.risk_score,
+        projected_deficit_year: d.projected_deficit_year,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function triggerN8nWebhookForLinkedInPost(postRecord, sectorName, approvedBy, approvedAt) {
+  if (!N8N_WEBHOOK_URL) {
+    console.warn("N8N_WEBHOOK_URL not set; skipping webhook.");
+    return Promise.resolve();
+  }
+  const payload = {
+    sector_name: sectorName || postRecord.sector_name || "",
+    commodity: postRecord.commodity,
+    production: postRecord.production,
+    consumption: postRecord.consumption,
+    import_dependency: postRecord.import_dependency,
+    risk_score: postRecord.risk_score,
+    projected_deficit_year: postRecord.projected_deficit_year,
+    linkedin_post_content: postRecord.post_content,
+    hashtags: postRecord.hashtags || [],
+    approved_by: approvedBy,
+    approved_at: approvedAt ? new Date(approvedAt).toISOString() : new Date().toISOString(),
+  };
+  return fetch(N8N_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then((res) => {
+    if (!res.ok) throw new Error(`n8n webhook ${res.status}: ${res.statusText}`);
+  });
+}
+
+app.post("/api/sector-admin/decision", requireSectorAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const { post_id, decision } = req.body || {};
+  if (!post_id || (decision !== "approve" && decision !== "reject")) return res.status(400).json({ error: "post_id and decision (approve|reject) are required." });
+  let oid;
+  try { oid = new ObjectId(post_id); } catch { return res.status(404).json({ error: "Post not found." }); }
+  const post = await database.collection("linkedin_posts").findOne({ _id: oid });
+  if (!post) return res.status(404).json({ error: "Post not found." });
+  const sector_id = req.user.sector_id;
+  const sectorKey = req.user.sectorKey;
+  const belongs = sector_id ? post.sector_id && post.sector_id.toString() === sector_id : post.sector_key === sectorKey;
+  if (!belongs) return res.status(404).json({ error: "Post not found." });
+  if (post.status !== "pending") return res.status(400).json({ error: "Decision already recorded for this post." });
+  const now = new Date();
+  const newStatus = decision === "approve" ? "approved" : "rejected";
+  const update = { status: newStatus };
+  if (decision === "approve") {
+    update.approved_at = now;
+    update.approved_by = req.user.id;
+  }
+  await database.collection("linkedin_posts").updateOne({ _id: oid }, { $set: update });
+  await insertAuditLog(database, { user_id: req.user.id, action: decision === "approve" ? "approve_post" : "reject_post", sector_id: post.sector_id?.toString(), meta: { post_id } });
+  if (decision === "approve") {
+    let sectorName = "";
+    if (post.sector_id) {
+      const sec = await database.collection("sectors").findOne({ _id: post.sector_id });
+          if (sec) sectorName = sec.sector_name || "";
+        }
+    try {
+      await triggerN8nWebhookForLinkedInPost(post, sectorName, req.user.id, now);
+    } catch (err) {
+      console.error("n8n webhook error after sector approval:", err.message);
+    }
+  }
+  res.json({ ok: true, status: newStatus });
 });
 
 // ---------- OpenAI proxy (for frontend Predictions / GVA impact) ----------
