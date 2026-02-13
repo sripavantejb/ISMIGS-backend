@@ -215,32 +215,34 @@ function safeStringArray(value) {
 app.get("/api/sector-recipients", async (req, res) => {
   const database = getDb();
   if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  let rows;
   try {
-    const rows = await database.collection("sector_recipients").find({}).toArray();
-    const map = {};
-    for (const row of rows) {
-      try {
-        const sectorKey = row && (row.sector_key != null) ? String(row.sector_key) : null;
-        if (!sectorKey) continue;
-        map[sectorKey] = {
-          sector_key: sectorKey,
-          display_name: row.display_name != null ? String(row.display_name) : sectorKey,
-          emails: safeStringArray(row.emails),
-          updated_at: safeToISOString(row.updated_at),
-          label: row.label != null ? String(row.label) : null,
-          enabled: row.enabled !== false,
-          cc: safeStringArray(row.cc),
-          bcc: safeStringArray(row.bcc),
-        };
-      } catch (rowErr) {
-        console.warn("sector-recipients: skip invalid row", rowErr.message);
-      }
-    }
-    res.json(map);
+    rows = await database.collection("sector_recipients").find({}).toArray();
   } catch (e) {
-    console.error("GET /api/sector-recipients", e);
-    res.status(500).json({ error: e.message || "Failed to load sector recipients." });
+    console.error("GET /api/sector-recipients query failed", e);
+    res.setHeader("X-Sector-Recipients-Error", "1");
+    return res.status(200).json({});
   }
+  const map = {};
+  for (const row of rows) {
+    try {
+      const sectorKey = row && (row.sector_key != null) ? String(row.sector_key) : null;
+      if (!sectorKey) continue;
+      map[sectorKey] = {
+        sector_key: sectorKey,
+        display_name: row.display_name != null ? String(row.display_name) : sectorKey,
+        emails: safeStringArray(row.emails),
+        updated_at: safeToISOString(row.updated_at),
+        label: row.label != null ? String(row.label) : null,
+        enabled: row.enabled !== false,
+        cc: safeStringArray(row.cc),
+        bcc: safeStringArray(row.bcc),
+      };
+    } catch (rowErr) {
+      console.warn("sector-recipients: skip invalid row", rowErr.message);
+    }
+  }
+  res.json(map);
 });
 
 app.put("/api/sector-recipients", async (req, res) => {
