@@ -1234,6 +1234,33 @@ app.post("/api/admin/run-sector-alerts", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/api/admin/decisions", requireAuth, async (req, res) => {
+  const database = getDb();
+  if (!database) {
+    return res.status(503).json({ error: "MongoDB not configured." });
+  }
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  try {
+    const items = await database
+      .collection("admin_decisions")
+      .find({})
+      .sort({ created_at: -1 })
+      .limit(limit)
+      .toArray();
+    res.json({
+      items: items.map((doc) => ({
+        id: doc._id.toString(),
+        commodity: doc.commodity ?? null,
+        status: doc.status ?? "pending",
+        created_at: doc.created_at ? new Date(doc.created_at).toISOString() : null,
+        responded_at: doc.responded_at ? new Date(doc.responded_at).toISOString() : null,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/send-email", async (req, res) => {
   const { to, subject, text, html } = req.body || {};
   if (!Array.isArray(to) || to.length === 0 || !subject) {
