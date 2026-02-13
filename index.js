@@ -197,27 +197,49 @@ app.get("/api/auth/me", (req, res) => {
 
 // ---------- Sector recipients ----------
 
+function safeToISOString(value) {
+  if (value == null) return new Date().toISOString();
+  try {
+    const d = new Date(value);
+    return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+  } catch {
+    return new Date().toISOString();
+  }
+}
+
+function safeStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((e) => (e != null ? String(e).trim() : "")).filter(Boolean);
+}
+
 app.get("/api/sector-recipients", async (req, res) => {
   const database = getDb();
   if (!database) return res.status(503).json({ error: "MongoDB not configured." });
   try {
     const rows = await database.collection("sector_recipients").find({}).toArray();
     const map = {};
-    rows.forEach((row) => {
-      map[row.sector_key] = {
-        sector_key: row.sector_key,
-        display_name: row.display_name || row.sector_key,
-        emails: row.emails || [],
-        updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString(),
-        label: row.label ?? null,
-        enabled: row.enabled !== false,
-        cc: row.cc || [],
-        bcc: row.bcc || [],
-      };
-    });
+    for (const row of rows) {
+      try {
+        const sectorKey = row && (row.sector_key != null) ? String(row.sector_key) : null;
+        if (!sectorKey) continue;
+        map[sectorKey] = {
+          sector_key: sectorKey,
+          display_name: row.display_name != null ? String(row.display_name) : sectorKey,
+          emails: safeStringArray(row.emails),
+          updated_at: safeToISOString(row.updated_at),
+          label: row.label != null ? String(row.label) : null,
+          enabled: row.enabled !== false,
+          cc: safeStringArray(row.cc),
+          bcc: safeStringArray(row.bcc),
+        };
+      } catch (rowErr) {
+        console.warn("sector-recipients: skip invalid row", rowErr.message);
+      }
+    }
     res.json(map);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("GET /api/sector-recipients", e);
+    res.status(500).json({ error: e.message || "Failed to load sector recipients." });
   }
 });
 
