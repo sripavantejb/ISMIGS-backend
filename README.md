@@ -5,7 +5,7 @@ Full admin-panel backend: MongoDB (sector recipients, email logs, settings), JWT
 ## Setup
 
 1. `cd backend && npm install`
-2. Copy `.env.example` to `.env` and set `MONGODB_URI`, `JWT_SECRET`, optional SMTP credentials, and **`OPENAI_API_KEY`** (required for test emails and digest: sector LinkedIn posts; get one at https://platform.openai.com/api-keys).
+2. Copy `.env.example` to `.env` and set `MONGODB_URI`, `JWT_SECRET`, optional SMTP credentials, and **`OPENAI_API_KEY`** (required for test emails and digest: sector LinkedIn posts; get one at https://platform.openai.com/api-keys). Optional fallback **`OPEN_AI_API_KEY_ADMIN`** is used when the primary key is unset or when a request returns 401.
 3. Run `npm run dev` (or `npm start`).
 
 Server runs on port 3001. The frontend Vite app proxies `/api` to this server in development.
@@ -32,7 +32,7 @@ Set these **Environment Variables** in your backend project (e.g. ismigs-backend
 
 - **MONGODB_URI** – required
 - **JWT_SECRET** – required
-- **OPENAI_API_KEY** – required for test emails and digest (sector LinkedIn posts). Create at https://platform.openai.com/api-keys and add it in Vercel: Project → Settings → Environment Variables → add `OPENAI_API_KEY` for Production (and Preview if needed), then redeploy.
+- **OPENAI_API_KEY** – required for test emails and digest (sector LinkedIn posts). Create at https://platform.openai.com/api-keys and add it in Vercel: Project → Settings → Environment Variables → add `OPENAI_API_KEY` for Production (and Preview if needed), then redeploy. Optional **OPEN_AI_API_KEY_ADMIN** is used when the primary key is unset or when a request returns 401.
 
 Optional: SMTP_*, APPROVAL_BASE_URL, LINKEDIN_WEBHOOK_URL.
 

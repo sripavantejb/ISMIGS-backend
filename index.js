@@ -92,10 +92,18 @@ async function insertEmailLog(sector_key, recipient, subject, success, error_mes
   });
 }
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+function getOpenAIKey() {
+  const p = (process.env.OPENAI_API_KEY || "").trim();
+  const f = (process.env.OPEN_AI_API_KEY_ADMIN || "").trim();
+  return p || f || "";
+}
+function getOpenAIFallbackKey() {
+  return (process.env.OPEN_AI_API_KEY_ADMIN || "").trim();
+}
 
 async function generateLinkedInDigest(insights, warnings) {
-  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required for digest emails");
+  const key = getOpenAIKey();
+  if (!key) throw new Error("OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN required for digest emails");
   const insightList = Array.isArray(insights) ? insights.filter((s) => String(s).trim()) : [];
   const warningList = Array.isArray(warnings) ? warnings.filter((s) => String(s).trim()) : [];
   const hasContent = insightList.length > 0 || warningList.length > 0;
@@ -106,26 +114,32 @@ async function generateLinkedInDigest(insights, warnings) {
   ]
     .filter(Boolean)
     .join("\n\n");
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const body = {
+    model: "gpt-3.5-turbo",
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a macro intelligence writer. Turn the given top insights and critical warnings from a government macro dashboard into a single LinkedIn-style post. Use one short hook line, then 2-3 short paragraphs or bullet points. Be professional, data-driven, and suitable for policymakers and analysts. Maximum 300 words. No hashtags.",
+      },
+      { role: "user", content: userContent },
+    ],
+    max_tokens: 400,
+    temperature: 0.4,
+  };
+  let res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-3.5-turbo",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a macro intelligence writer. Turn the given top insights and critical warnings from a government macro dashboard into a single LinkedIn-style post. Use one short hook line, then 2-3 short paragraphs or bullet points. Be professional, data-driven, and suitable for policymakers and analysts. Maximum 300 words. No hashtags.",
-        },
-        { role: "user", content: userContent },
-      ],
-      max_tokens: 400,
-      temperature: 0.4,
-    }),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify(body),
   });
+  const fallbackKey = getOpenAIFallbackKey();
+  if (res.status === 401 && fallbackKey && fallbackKey !== key) {
+    res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${fallbackKey}` },
+      body: JSON.stringify(body),
+    });
+  }
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(`OpenAI API error: ${res.status} ${errText.slice(0, 200)}`);
@@ -154,27 +168,34 @@ function extractHashtagsFromText(text) {
 }
 
 async function generateSectorSamplePost(sector_key, displayName) {
-  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required for test emails");
+  const key = getOpenAIKey();
+  if (!key) throw new Error("OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN required for test emails");
   const sectorType = getSectorType(sector_key);
   const systemPrompt =
     "You are a macro intelligence writer for ISMIGS (India State Macro Intelligence). Subscribers receive sector-specific notifications and updates on the ISMIGS dashboard. Write a short LinkedIn-style post that summarizes the kind of notifications and updates this sector sees: use the sector type and name to tailor content (e.g. IIP = industrial production indices and growth; WPI = wholesale price inflation; Energy = supply, consumption, and commodity prices; GVA = industry-wise GVA; Custom = general macro and policy updates). Be professional, data-driven, and suitable for policymakers and analysts. Maximum 150 words. End with 5-8 relevant hashtags (e.g. #ISMIGS #IndiaEconomy #Manufacturing).";
   const userPrompt = `Sector: ${displayName}. Sector type: ${sectorType}. Write a LinkedIn post summarizing the type of notifications and updates this sector would see on the ISMIGS dashboard.`;
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const body = {
+    model: "gpt-3.5-turbo",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    max_tokens: 250,
+    temperature: 0.4,
+  };
+  let res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-3.5-turbo",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      max_tokens: 250,
-      temperature: 0.4,
-    }),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify(body),
   });
+  const fallbackKey = getOpenAIFallbackKey();
+  if (res.status === 401 && fallbackKey && fallbackKey !== key) {
+    res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${fallbackKey}` },
+      body: JSON.stringify(body),
+    });
+  }
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(`OpenAI API error: ${res.status} ${errText.slice(0, 200)}`);
@@ -338,15 +359,15 @@ app.get("/api/auth/me", (req, res) => {
 // ---------- OpenAI proxy (for frontend Predictions / GVA impact) ----------
 
 app.post("/api/openai/v1/chat/completions", async (req, res) => {
-  const key = (OPENAI_API_KEY || "").trim();
+  const key = getOpenAIKey();
   if (!key) {
     return res.status(503).json({
-      error: "OpenAI API key not configured. Set OPENAI_API_KEY in Vercel (Settings → Environment Variables) and redeploy the backend.",
+      error: "OpenAI API key not configured. Set OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN in Vercel (Settings → Environment Variables) and redeploy the backend.",
     });
   }
   const body = req.body && typeof req.body === "object" ? req.body : {};
   try {
-    const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+    let upstream = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -354,6 +375,17 @@ app.post("/api/openai/v1/chat/completions", async (req, res) => {
       },
       body: JSON.stringify(body),
     });
+    const fallbackKey = getOpenAIFallbackKey();
+    if (upstream.status === 401 && fallbackKey && fallbackKey !== key) {
+      upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${fallbackKey}`,
+        },
+        body: JSON.stringify(body),
+      });
+    }
     const text = await upstream.text();
     const contentType = upstream.headers.get("content-type") || "application/json";
     res.setHeader("Content-Type", contentType);
@@ -679,7 +711,7 @@ async function sendOneSector(sector_key, bodyEmails, isTest, settings, transport
   const subject = isTest ? `ISMIGS – Test notification for ${displayName}` : `ISMIGS – Update for ${displayName}`;
   let text, html;
   if (isTest) {
-    if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required for test emails.");
+    if (!getOpenAIKey()) throw new Error("OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN required for test emails.");
     let linkedin_post_text, hashtags, commodity, production, consumption, import_dependency, risk_score, projected_deficit_year, sector_impact;
     const sectorType = getSectorType(sector_key);
     if (sectorType === "energy") {
@@ -769,8 +801,8 @@ app.post("/api/send-sector-email", async (req, res) => {
   const hasDigestInput =
     (Array.isArray(insights) && insights.some((s) => String(s).trim())) ||
     (Array.isArray(warnings) && warnings.some((s) => String(s).trim()));
-  if (hasDigestInput && !OPENAI_API_KEY) {
-    return res.status(503).json({ error: "OPENAI_API_KEY required for digest emails." });
+  if (hasDigestInput && !getOpenAIKey()) {
+    return res.status(503).json({ error: "OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN required for digest emails." });
   }
 
   if (sector_key === "all") {
@@ -825,8 +857,8 @@ app.post("/api/send-sector-email", async (req, res) => {
         return res.status(500).json({ error: e.message });
       }
     }
-    if (!OPENAI_API_KEY) {
-      return res.status(503).json({ error: "OPENAI_API_KEY required for test emails." });
+    if (!getOpenAIKey()) {
+      return res.status(503).json({ error: "OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN required for test emails." });
     }
     const results = [];
     let totalSent = 0, totalFailed = 0;
@@ -882,8 +914,8 @@ app.post("/api/send-sector-email", async (req, res) => {
   } else {
     subject = isTest ? `ISMIGS – Test notification for ${displayName}` : `ISMIGS – Update for ${displayName}`;
     if (isTest) {
-      if (!OPENAI_API_KEY) {
-        return res.status(503).json({ error: "OPENAI_API_KEY required for test emails." });
+      if (!getOpenAIKey()) {
+        return res.status(503).json({ error: "OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN required for test emails." });
       }
       try {
         let linkedin_post_text, hashtags, commodity, production, consumption, import_dependency, risk_score, projected_deficit_year, sector_impact;
@@ -1043,7 +1075,7 @@ app.get("/api/energy-commodities", async (_req, res) => {
 });
 
 const OPENAI_KEY_REQUIRED_MSG =
-  "OpenAI API key not configured. Set OPENAI_API_KEY in Vercel (ismigs-backend → Settings → Environment Variables) and redeploy.";
+  "OpenAI API key not configured. Set OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN in Vercel (ismigs-backend → Settings → Environment Variables) and redeploy.";
 
 app.post("/api/send-energy-disclosure", async (req, res) => {
   const { commodity, adminEmail } = req.body || {};
@@ -1052,7 +1084,7 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
   if (!email) {
     return res.status(400).json({ error: "adminEmail is required." });
   }
-  if (!(process.env.OPENAI_API_KEY || "").trim()) {
+  if (!getOpenAIKey()) {
     return res.status(503).json({ error: OPENAI_KEY_REQUIRED_MSG });
   }
   const settings = await getSettings();
@@ -1103,10 +1135,10 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
   } catch (e) {
     const msg = e.message || "";
     const isKeyMissing =
-      /OPENAI_API_KEY required/i.test(msg) ||
+      /OPENAI_API_KEY|OPEN_AI_API_KEY_ADMIN required/i.test(msg) ||
       /OpenAI API error: 401|invalid.*api.*key|incorrect.*key|api_key|authentication/i.test(msg);
     const isUpstream =
-      /OPENAI_API_KEY|OpenAI API|api\.openai\.com|No energy commodity|fetchWithRetry|MOSPI|Energy data|fetch failed/i.test(msg);
+      /OPENAI_API_KEY|OPEN_AI_API_KEY_ADMIN|OpenAI API|api\.openai\.com|No energy commodity|fetchWithRetry|MOSPI|Energy data|fetch failed/i.test(msg);
     const isEmail = /sendMail|Ethereal|createTestAccount|SMTP|timeout/i.test(msg);
     if (isKeyMissing) {
       console.error("send-energy-disclosure error:", e.message);
@@ -1115,7 +1147,7 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
     if (isUpstream) {
       console.error("send-energy-disclosure error:", e.message);
       return res.status(502).json({
-        error: "LinkedIn post generation failed. Commodity data or OpenAI may be temporarily unavailable. Try again, or set OPENAI_API_KEY in Vercel (ismigs-backend) and redeploy.",
+        error: "LinkedIn post generation failed. Commodity data or OpenAI may be temporarily unavailable. Try again, or set OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN in Vercel (ismigs-backend) and redeploy.",
       });
     }
     if (isEmail) {

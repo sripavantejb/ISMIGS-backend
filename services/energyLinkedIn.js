@@ -49,9 +49,11 @@ export async function generateLinkedInPost(commodityId) {
     sector_impact: sectorImpact,
   };
 
-  const openaiKey = (process.env.OPENAI_API_KEY || "").trim();
+  const primaryKey = (process.env.OPENAI_API_KEY || "").trim();
+  const fallbackKey = (process.env.OPEN_AI_API_KEY_ADMIN || "").trim();
+  const openaiKey = primaryKey || fallbackKey;
   if (!openaiKey) {
-    throw new Error("OPENAI_API_KEY required for LinkedIn post generation.");
+    throw new Error("OPENAI_API_KEY or OPEN_AI_API_KEY_ADMIN required for LinkedIn post generation.");
   }
 
   const dataBlurb = [
@@ -80,22 +82,33 @@ export async function generateLinkedInPost(commodityId) {
 - One short strategic insight (1-2 sentences).
 - End with 5-8 relevant hashtags based on the commodity (e.g. #ISMIGS #EnergySecurity #Coal #India). Use only the numbers and facts provided. Maximum 200 words. Professional tone.`;
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const body = {
+    model: "gpt-3.5-turbo",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: `Data:\n${dataBlurb}` },
+    ],
+    max_tokens: 400,
+    temperature: 0.4,
+  };
+  let res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${openaiKey}`,
     },
-    body: JSON.stringify({
-      model: "gpt-3.5-turbo",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: `Data:\n${dataBlurb}` },
-      ],
-      max_tokens: 400,
-      temperature: 0.4,
-    }),
+    body: JSON.stringify(body),
   });
+  if (res.status === 401 && fallbackKey && fallbackKey !== openaiKey) {
+    res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${fallbackKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+  }
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(`OpenAI API error: ${res.status} ${errText.slice(0, 200)}`);
