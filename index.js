@@ -908,34 +908,35 @@ async function triggerN8nWebhookForLinkedInPost(postRecord, sectorName, approved
     console.warn("N8N_WEBHOOK_URL not set; skipping webhook.");
     return;
   }
-  const payload = {
-    commodity: postRecord.commodity,
-    production: postRecord.production,
-    consumption: postRecord.consumption,
-    import_dependency: postRecord.import_dependency,
-    risk_score: postRecord.risk_score,
-    projected_deficit_year: postRecord.projected_deficit_year,
-    sector_impact: postRecord.sector_impact ?? null,
-    linkedin_post_text: postRecord.post_content,
-    hashtags: postRecord.hashtags || [],
-    approved_at: approvedAt ? new Date(approvedAt).toISOString() : new Date().toISOString(),
-    sector_name: sectorName || postRecord.sector_name || "",
-    approved_by: approvedBy,
-  };
-  const doPost = async () => {
-    const res = await fetch(N8N_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+  const fullContent = postRecord.post_content ?? "";
+  const approvedAtIso = approvedAt ? new Date(approvedAt).toISOString() : new Date().toISOString();
+  const hashtagsArr = Array.isArray(postRecord.hashtags) ? postRecord.hashtags : [];
+  const params = new URLSearchParams();
+  params.set("commodity", String(postRecord.commodity ?? ""));
+  if (postRecord.production != null) params.set("production", String(postRecord.production));
+  if (postRecord.consumption != null) params.set("consumption", String(postRecord.consumption));
+  if (postRecord.import_dependency != null) params.set("import_dependency", String(postRecord.import_dependency));
+  if (postRecord.risk_score != null) params.set("risk_score", String(postRecord.risk_score));
+  if (postRecord.projected_deficit_year != null) params.set("projected_deficit_year", String(postRecord.projected_deficit_year));
+  if (postRecord.sector_impact != null) params.set("sector_impact", String(postRecord.sector_impact));
+  params.set("linkedin_post_text", fullContent);
+  params.set("body", fullContent);
+  params.set("hashtags", JSON.stringify(hashtagsArr));
+  params.set("approved_at", approvedAtIso);
+  params.set("sector_name", String(sectorName || postRecord.sector_name || ""));
+  params.set("approved_by", String(approvedBy ?? ""));
+  const separator = N8N_WEBHOOK_URL.includes("?") ? "&" : "?";
+  const url = `${N8N_WEBHOOK_URL}${separator}${params.toString()}`;
+  const doGet = async () => {
+    const res = await fetch(url, { method: "GET" });
     if (!res.ok) throw new Error(`n8n webhook ${res.status}: ${await res.text()}`);
   };
   try {
-    await doPost();
+    await doGet();
   } catch (err) {
     console.error("n8n webhook failed after sector approval:", err.message);
     try {
-      await doPost();
+      await doGet();
     } catch (retryErr) {
       console.error("n8n webhook retry failed after sector approval:", retryErr.message);
       throw retryErr;
