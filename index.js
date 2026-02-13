@@ -199,7 +199,11 @@ function getDecisionRedirectUrl(result) {
 }
 
 function getBackendPublicUrl() {
-  return (process.env.BACKEND_PUBLIC_URL || process.env.API_BASE_URL || "").replace(/\/$/, "") || `http://localhost:${process.env.PORT || 3001}`;
+  const explicit = (process.env.BACKEND_PUBLIC_URL || process.env.API_BASE_URL || "").trim().replace(/\/$/, "");
+  if (explicit) return explicit;
+  const vercelUrl = process.env.VERCEL_URL;
+  if (vercelUrl) return `https://${String(vercelUrl).replace(/^https?:\/\//, "").replace(/\/$/, "")}`;
+  return `http://localhost:${process.env.PORT || 3001}`;
 }
 
 function appendConfirmationBlock(linkedin_post_text, hashtags, token) {
