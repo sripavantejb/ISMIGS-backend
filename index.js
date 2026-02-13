@@ -1098,9 +1098,11 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
     });
   } catch (e) {
     const msg = e.message || "";
-    const isKeyMissing = /OPENAI_API_KEY required/i.test(msg);
+    const isKeyMissing =
+      /OPENAI_API_KEY required/i.test(msg) ||
+      /OpenAI API error: 401|invalid.*api.*key|incorrect.*key|api_key|authentication/i.test(msg);
     const isUpstream =
-      /OPENAI_API_KEY|OpenAI API|api\.openai\.com|No energy commodity|fetchWithRetry|MOSPI|Energy data/i.test(msg);
+      /OPENAI_API_KEY|OpenAI API|api\.openai\.com|No energy commodity|fetchWithRetry|MOSPI|Energy data|fetch failed/i.test(msg);
     const isEmail = /sendMail|Ethereal|createTestAccount|SMTP|timeout/i.test(msg);
     if (isKeyMissing) {
       console.error("send-energy-disclosure error:", e.message);
@@ -1109,7 +1111,7 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
     if (isUpstream) {
       console.error("send-energy-disclosure error:", e.message);
       return res.status(502).json({
-        error: "LinkedIn post generation failed. Check OPENAI_API_KEY and upstream data.",
+        error: "LinkedIn post generation failed. Commodity data or OpenAI may be temporarily unavailable. Try again, or set OPENAI_API_KEY in Vercel (ismigs-backend) and redeploy.",
       });
     }
     if (isEmail) {
