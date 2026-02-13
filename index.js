@@ -331,6 +331,33 @@ app.get("/api/auth/me", (req, res) => {
   res.json({ user: req.user || "admin" });
 });
 
+// ---------- OpenAI proxy (for frontend Predictions / GVA impact) ----------
+
+app.post("/api/openai/v1/chat/completions", async (req, res) => {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) {
+    return res.status(503).json({ error: "OpenAI API key not configured." });
+  }
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await upstream.text();
+    const contentType = upstream.headers.get("content-type") || "application/json";
+    res.setHeader("Content-Type", contentType);
+    res.status(upstream.status).send(text);
+  } catch (e) {
+    console.error("OpenAI proxy error:", e.message);
+    res.status(502).json({ error: "Failed to reach OpenAI. Try again later." });
+  }
+});
+
 // ---------- Sector recipients ----------
 
 function safeToISOString(value) {
@@ -600,6 +627,8 @@ app.get("/api/email-logs", async (req, res) => {
 
 // ---------- Send sector email ----------
 
+const ETHERAL_TIMEOUT_MS = 8000;
+
 async function createEtherealTransport() {
   const testAccount = await nodemailer.createTestAccount();
   const transport = nodemailer.createTransport({
@@ -610,6 +639,15 @@ async function createEtherealTransport() {
   });
   const fromAddr = `ISMIGS Dev <${testAccount.user}>`;
   return { transport, fromAddr };
+}
+
+function createEtherealTransportWithTimeout() {
+  return Promise.race([
+    createEtherealTransport(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Ethereal timeout")), ETHERAL_TIMEOUT_MS)
+    ),
+  ]);
 }
 
 async function sendOneSector(sector_key, bodyEmails, isTest, settings, transport, fromAddr) {
@@ -1019,15 +1057,30 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
       auth: { user: smtpUser, pass: smtpPass },
     });
   } else {
-    const ethereal = await createEtherealTransport();
-    transport = ethereal.transport;
-    fromAddr = ethereal.fromAddr;
+    try {
+      const ethereal = await createEtherealTransportWithTimeout();
+      transport = ethereal.transport;
+      fromAddr = ethereal.fromAddr;
+    } catch (e) {
+      console.error("send-energy-disclosure ethereal:", e.message);
+      return res.status(503).json({
+        error: "Email transport not configured. Set SMTP_* env vars for production.",
+      });
+    }
+  }
+  let commodityList = [];
+  try {
+    commodityList = await listCommodities();
+  } catch (e) {
+    console.error("send-energy-disclosure listCommodities:", e.message);
+    return res.status(502).json({ error: "Energy data temporarily unavailable." });
+  }
+  const commodityToUse =
+    commodityName && commodityList.includes(commodityName) ? commodityName : commodityList[0] || null;
+  if (!commodityToUse) {
+    return res.status(400).json({ error: "No commodity specified and no energy data available." });
   }
   try {
-    const commodityToUse = commodityName || (await listCommodities()).then((c) => c[0]).catch(() => null);
-    if (!commodityToUse) {
-      return res.status(400).json({ error: "No commodity specified and no energy data available." });
-    }
     const postData = await generateLinkedInPost(commodityToUse);
     await sendConfirmationEmail(email, postData, transport, fromAddr);
     res.json({
@@ -1036,8 +1089,22 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
       commodity: commodityToUse,
     });
   } catch (e) {
-    console.error("send-energy-disclosure error:", e.message);
-    res.status(500).json({ error: e.message || "Failed to send energy disclosure." });
+    const msg = e.message || "";
+    const isUpstream =
+      /OPENAI_API_KEY|OpenAI API|api\.openai\.com|No energy commodity|fetchWithRetry|MOSPI|Energy data/i.test(msg);
+    const isEmail = /sendMail|Ethereal|createTestAccount|SMTP|timeout/i.test(msg);
+    if (isUpstream) {
+      console.error("send-energy-disclosure error:", e.message);
+      return res.status(502).json({
+        error: "LinkedIn post generation failed. Check OPENAI_API_KEY and upstream data.",
+      });
+    }
+    if (isEmail) {
+      console.error("send-energy-disclosure error:", e.message);
+      return res.status(503).json({ error: "Email service temporarily unavailable." });
+    }
+    console.error("send-energy-disclosure error:", e.stack || e.message);
+    return res.status(500).json({ error: e.message || "Failed to send energy disclosure." });
   }
 });
 
