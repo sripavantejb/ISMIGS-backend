@@ -599,6 +599,31 @@ app.post("/api/superadmin/create-sector-admin", requireSuperAdmin, async (req, r
   }
 });
 
+app.post("/api/superadmin/ensure-sector", requireSuperAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const { sector_key, sector_name } = req.body || {};
+  const key = typeof sector_key === "string" ? sector_key.trim() : "";
+  const name = typeof sector_name === "string" ? sector_name.trim() : "";
+  if (!key) return res.status(400).json({ error: "sector_key is required." });
+  const sector_name_final = name || key;
+  try {
+    let sector = await database.collection("sectors").findOne({ sector_key: key });
+    if (!sector) {
+      const doc = { sector_name: sector_name_final, sector_key: key, created_at: new Date() };
+      const result = await database.collection("sectors").insertOne(doc);
+      sector = { _id: result.insertedId, ...doc };
+    }
+    res.json({
+      id: sector._id.toString(),
+      sector_name: sector.sector_name,
+      sector_key: sector.sector_key,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/api/superadmin/sectors", requireSuperAdmin, async (req, res) => {
   const database = getDb();
   if (!database) return res.status(503).json({ error: "MongoDB not configured." });
