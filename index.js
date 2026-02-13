@@ -1038,12 +1038,18 @@ app.get("/api/energy-commodities", async (_req, res) => {
   }
 });
 
+const OPENAI_KEY_REQUIRED_MSG =
+  "OpenAI API key not configured. Set OPENAI_API_KEY in Vercel (ismigs-backend → Settings → Environment Variables) and redeploy.";
+
 app.post("/api/send-energy-disclosure", async (req, res) => {
   const { commodity, adminEmail } = req.body || {};
   const email = typeof adminEmail === "string" ? adminEmail.trim() : "";
   const commodityName = typeof commodity === "string" ? commodity.trim() : null;
   if (!email) {
     return res.status(400).json({ error: "adminEmail is required." });
+  }
+  if (!(process.env.OPENAI_API_KEY || "").trim()) {
+    return res.status(503).json({ error: OPENAI_KEY_REQUIRED_MSG });
   }
   const settings = await getSettings();
   if (settings.notifications_enabled === false) {
@@ -1092,9 +1098,14 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
     });
   } catch (e) {
     const msg = e.message || "";
+    const isKeyMissing = /OPENAI_API_KEY required/i.test(msg);
     const isUpstream =
       /OPENAI_API_KEY|OpenAI API|api\.openai\.com|No energy commodity|fetchWithRetry|MOSPI|Energy data/i.test(msg);
     const isEmail = /sendMail|Ethereal|createTestAccount|SMTP|timeout/i.test(msg);
+    if (isKeyMissing) {
+      console.error("send-energy-disclosure error:", e.message);
+      return res.status(503).json({ error: OPENAI_KEY_REQUIRED_MSG });
+    }
     if (isUpstream) {
       console.error("send-energy-disclosure error:", e.message);
       return res.status(502).json({
