@@ -644,6 +644,31 @@ app.get("/api/superadmin/sectors", requireSuperAdmin, async (req, res) => {
   }
 });
 
+app.get("/api/superadmin/sectors-with-admins", requireSuperAdmin, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  try {
+    const list = await database.collection("sectors").find({}).sort({ created_at: -1 }).toArray();
+    const sectorIds = list.map((d) => d._id);
+    const admins = await database.collection("users").find({ role: "SECTOR_ADMIN", sector_id: { $in: sectorIds } }).project({ sector_id: 1, name: 1, email: 1 }).toArray();
+    const adminBySectorId = Object.fromEntries(admins.map((a) => [a.sector_id && a.sector_id.toString(), a]).filter(([k]) => k));
+    res.json(list.map((d) => {
+      const sid = d._id.toString();
+      const admin = adminBySectorId[sid] || null;
+      return {
+        sector_id: sid,
+        sector_name: d.sector_name,
+        sector_key: d.sector_key ?? null,
+        created_at: d.created_at ? new Date(d.created_at).toISOString() : null,
+        admin_name: admin ? admin.name : null,
+        admin_email: admin ? admin.email : null,
+      };
+    }));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/api/superadmin/all-approvals", requireSuperAdmin, async (req, res) => {
   const database = getDb();
   if (!database) return res.status(503).json({ error: "MongoDB not configured." });
