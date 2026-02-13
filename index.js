@@ -9,7 +9,8 @@ import express from "express";
 import cors from "cors";
 import nodemailer from "nodemailer";
 import jwt from "jsonwebtoken";
-import { MongoClient } from "mongodb";
+import bcrypt from "bcrypt";
+import { MongoClient, ObjectId } from "mongodb";
 import { generateLinkedInPost } from "./services/energyLinkedIn.js";
 import { fetchCommodityStats, listCommodities } from "./services/energyData.js";
 
@@ -31,8 +32,10 @@ async function connectDb() {
   db = client.db(DB_NAME);
   await db.collection("admin_settings").createIndex({ key: 1 }, { unique: true }).catch(() => {});
   await db.collection("sector_recipients").createIndex({ sector_key: 1 }, { unique: true }).catch(() => {});
+  await db.collection("sector_recipients").createIndex({ sector_username: 1 }, { unique: true, sparse: true }).catch(() => {});
   await db.collection("admin_decisions").createIndex({ token: 1 }, { unique: true }).catch(() => {});
   await db.collection("admin_decisions").createIndex({ expires_at: 1 }).catch(() => {});
+  await db.collection("admin_decisions").createIndex({ sector_key: 1 }).catch(() => {});
   await db.collection("sector_alerts_log").createIndex({ commodity: 1, sector: 1, sent_at: 1 }).catch(() => {});
   return db;
 }
@@ -50,6 +53,24 @@ function requireAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     req.user = payload.sub;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+}
+
+function requireSectorAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  const token = auth && auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.role !== "sector") {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    req.sectorKey = payload.sub;
     next();
   } catch {
     return res.status(401).json({ error: "Unauthorized" });
@@ -157,6 +178,10 @@ function getSectorType(sector_key) {
   const type = sector_key.slice(0, idx).toLowerCase();
   if (["custom", "energy", "wpi", "iip", "gva"].includes(type)) return type;
   return "custom";
+}
+
+function slugifyCommodity(s) {
+  return String(s).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
 }
 
 function extractHashtagsFromText(text) {
@@ -306,8 +331,10 @@ async function sendConfirmationEmail(adminEmail, postData, transport, fromAddr) 
   const token = crypto.randomUUID();
   const now = new Date();
   const expiresAt = new Date(now.getTime() + DECISION_TTL_HOURS * 60 * 60 * 1000);
+  const sectorKeyEnergy = "energy:" + slugifyCommodity(postData.commodity);
   const decision = {
     token,
+    sector_key: sectorKeyEnergy,
     commodity: postData.commodity,
     linkedin_post_text: postData.linkedin_post_text,
     hashtags: Array.isArray(postData.hashtags) ? postData.hashtags : [postData.hashtags].filter(Boolean),
@@ -369,6 +396,34 @@ app.post("/api/auth/login", async (req, res) => {
     return res.json({ token });
   }
   return res.status(401).json({ error: "Invalid username or password." });
+});
+
+app.post("/api/auth/sector-login", async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const { username, password } = req.body || {};
+  const u = typeof username === "string" ? username.trim() : "";
+  const p = typeof password === "string" ? password : "";
+  if (!u || !p) {
+    return res.status(400).json({ error: "Username and password are required." });
+  }
+  const row = await database.collection("sector_recipients").findOne({
+    sector_username: u,
+    enabled: { $ne: false },
+  });
+  if (!row || !row.sector_password_hash) {
+    return res.status(401).json({ error: "Invalid username or password." });
+  }
+  const match = await bcrypt.compare(p, row.sector_password_hash);
+  if (!match) {
+    return res.status(401).json({ error: "Invalid username or password." });
+  }
+  const token = jwt.sign(
+    { sub: row.sector_key, role: "sector", iat: Math.floor(Date.now() / 1000) },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+  return res.json({ token, sector_key: row.sector_key });
 });
 
 // Auth skipped for now – no JWT required on /api routes
@@ -460,6 +515,8 @@ app.get("/api/sector-recipients", async (req, res) => {
         enabled: row.enabled !== false,
         cc: safeStringArray(row.cc),
         bcc: safeStringArray(row.bcc),
+        has_sector_login: !!(row.sector_username && row.sector_password_hash),
+        sector_username: row.sector_username != null ? String(row.sector_username) : null,
       };
     } catch (rowErr) {
       console.warn("sector-recipients: skip invalid row", rowErr.message);
@@ -471,7 +528,7 @@ app.get("/api/sector-recipients", async (req, res) => {
 app.put("/api/sector-recipients", async (req, res) => {
   const database = getDb();
   if (!database) return res.status(503).json({ error: "MongoDB not configured." });
-  const { sector_key, display_name, emails, label, enabled, cc, bcc } = req.body || {};
+  const { sector_key, display_name, emails, label, enabled, cc, bcc, sector_username, sector_password } = req.body || {};
   if (!sector_key || typeof display_name !== "string") {
     return res.status(400).json({ error: "Body must include sector_key and display_name." });
   }
@@ -486,10 +543,26 @@ app.put("/api/sector-recipients", async (req, res) => {
     cc: Array.isArray(cc) ? cc.filter((e) => String(e).trim()) : [],
     bcc: Array.isArray(bcc) ? bcc.filter((e) => String(e).trim()) : [],
   };
+  const usernameTrimmed = typeof sector_username === "string" ? sector_username.trim() : null;
+  const sectorUsernameExplicit = req.body && "sector_username" in req.body;
+  if (usernameTrimmed) {
+    const existing = await database.collection("sector_recipients").findOne({ sector_username: usernameTrimmed });
+    if (existing && existing.sector_key !== sector_key) {
+      return res.status(400).json({ error: "Sector login username is already used by another sector." });
+    }
+    payload.sector_username = usernameTrimmed;
+  }
+  if (typeof sector_password === "string" && sector_password.length > 0) {
+    payload.sector_password_hash = await bcrypt.hash(sector_password, 10);
+  }
   try {
+    const updateOp = { $set: payload };
+    if (sectorUsernameExplicit && !usernameTrimmed) {
+      updateOp.$unset = { sector_username: "", sector_password_hash: "" };
+    }
     await database.collection("sector_recipients").updateOne(
       { sector_key },
-      { $set: payload },
+      updateOp,
       { upsert: true }
     );
     res.json({ ok: true });
@@ -765,6 +838,7 @@ async function sendOneSector(sector_key, bodyEmails, isTest, settings, transport
     const expiresAt = new Date(now.getTime() + DECISION_TTL_HOURS * 60 * 60 * 1000);
     const decision = {
       token,
+      sector_key: sector_key,
       commodity: commodity || displayName,
       linkedin_post_text,
       hashtags: Array.isArray(hashtags) ? hashtags : [hashtags].filter(Boolean),
@@ -971,6 +1045,7 @@ app.post("/api/send-sector-email", async (req, res) => {
         const expiresAt = new Date(now.getTime() + DECISION_TTL_HOURS * 60 * 60 * 1000);
         const decision = {
           token,
+          sector_key: sector_key,
           commodity: commodity || displayName,
           linkedin_post_text,
           hashtags: Array.isArray(hashtags) ? hashtags : [hashtags].filter(Boolean),
@@ -1091,6 +1166,90 @@ app.get("/api/admin/decision", async (req, res) => {
   return redirectOrConfigError(res, action === "approved" ? "approved" : "rejected");
 });
 
+// ---------- Sector panel: decisions (requireSectorAuth) ----------
+
+app.get("/api/sector/decisions", requireSectorAuth, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const sectorKey = req.sectorKey;
+  const statusFilter = req.query.status;
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  const filter = { sector_key: sectorKey };
+  if (statusFilter === "pending" || statusFilter === "approved" || statusFilter === "rejected") {
+    filter.status = statusFilter;
+  }
+  try {
+    const items = await database
+      .collection("admin_decisions")
+      .find(filter)
+      .sort({ created_at: -1 })
+      .limit(limit)
+      .toArray();
+    res.json({
+      items: items.map((doc) => ({
+        id: doc._id.toString(),
+        token: doc.token,
+        commodity: doc.commodity ?? null,
+        linkedin_post_text: doc.linkedin_post_text ?? null,
+        hashtags: doc.hashtags ?? [],
+        status: doc.status ?? "pending",
+        created_at: doc.created_at ? new Date(doc.created_at).toISOString() : null,
+        expires_at: doc.expires_at ? new Date(doc.expires_at).toISOString() : null,
+        responded_at: doc.responded_at ? new Date(doc.responded_at).toISOString() : null,
+        production: doc.production ?? null,
+        consumption: doc.consumption ?? null,
+        import_dependency: doc.import_dependency ?? null,
+        risk_score: doc.risk_score ?? null,
+        projected_deficit_year: doc.projected_deficit_year ?? null,
+        sector_impact: doc.sector_impact ?? null,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/sector/decision/:id/respond", requireSectorAuth, async (req, res) => {
+  const database = getDb();
+  if (!database) return res.status(503).json({ error: "MongoDB not configured." });
+  const sectorKey = req.sectorKey;
+  const { id } = req.params;
+  const { action } = req.body || {};
+  if (!id || (action !== "approve" && action !== "reject")) {
+    return res.status(400).json({ error: "Invalid id or action. Use action: 'approve' or 'reject'." });
+  }
+  let oid;
+  try {
+    oid = new ObjectId(id);
+  } catch {
+    return res.status(404).json({ error: "Decision not found." });
+  }
+  const doc = await database.collection("admin_decisions").findOne({ _id: oid });
+  if (!doc) return res.status(404).json({ error: "Decision not found." });
+  if (doc.sector_key !== sectorKey) return res.status(404).json({ error: "Decision not found." });
+  if (doc.status !== "pending") {
+    return res.status(400).json({ error: "Decision already responded." });
+  }
+  const now = new Date();
+  if (new Date(doc.expires_at) < now) {
+    return res.status(400).json({ error: "Decision link has expired." });
+  }
+  const newStatus = action === "approve" ? "approved" : "rejected";
+  await database.collection("admin_decisions").updateOne(
+    { _id: oid },
+    { $set: { status: newStatus, responded_at: now } }
+  );
+  if (action === "approve") {
+    try {
+      const updated = await database.collection("admin_decisions").findOne({ _id: oid });
+      await triggerN8nWebhook(updated || { ...doc, status: newStatus, responded_at: now });
+    } catch (err) {
+      console.error("n8n webhook error after sector approval:", err.message);
+    }
+  }
+  res.json({ ok: true, status: newStatus });
+});
+
 app.get("/api/energy-commodities", async (_req, res) => {
   try {
     const list = await listCommodities();
@@ -1188,10 +1347,6 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
 // ---------- Cron: sector critical alerts (every 6h) ----------
 
 const RISK_THRESHOLD = Number(process.env.ENERGY_RISK_THRESHOLD) || 40;
-
-function slugifyCommodity(s) {
-  return String(s).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
-}
 
 async function runSectorCriticalAlerts() {
   const database = getDb();
