@@ -36,9 +36,15 @@ Set these **Environment Variables** in your backend project (e.g. ismigs-backend
 
 - **FRONTEND_BASE_URL** – **required in production.** Set to your deployed frontend URL (e.g. `https://ismigs-frontend.vercel.app`). Without it, Yes/No redirects return 503 and users cannot reach the decision page after clicking the email link.
 
+**Vercel checklist for Gmail Yes/No links:**
+- **MONGODB_URI** – Must be set on Vercel; use the same DB as where disclosure emails are sent.
+- **BACKEND_PUBLIC_URL** – Public backend URL for Yes/No links (Vercel uses VERCEL_URL if unset).
+- **FRONTEND_BASE_URL** – Frontend URL for redirects after approval.
+- **DECISION_TOKEN_TTL_HOURS** – Optional; default 168 (7 days). Link validity in hours.
+
 When using the deployed frontend for the admin panel, ensure the frontend does not set `VITE_API_URL` to localhost so the admin panel and the email Yes/No link use the same backend; then the "LinkedIn post approval status" table will show "Approved for LinkedIn" after an admin clicks Yes.
 
-Optional: SMTP_*, APPROVAL_BASE_URL, LINKEDIN_WEBHOOK_URL.
+Optional: SMTP_*, APPROVAL_BASE_URL, LINKEDIN_WEBHOOK_URL, DECISION_TOKEN_TTL_HOURS.
 
 ## Data (MongoDB, database: ismigs)
 

@@ -212,6 +212,7 @@ async function generateSectorSamplePost(sector_key, displayName) {
 
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const CRON_SECRET = process.env.CRON_SECRET || "change-me-cron-secret";
+const DECISION_TTL_HOURS = Number(process.env.DECISION_TOKEN_TTL_HOURS) || 168; // 7 days default (was 48h)
 
 function getFrontendBaseUrl() {
   const explicit = (process.env.FRONTEND_BASE_URL || process.env.FRONTEND_PUBLIC_URL || process.env.VITE_APP_URL || "")
@@ -304,7 +305,7 @@ async function sendConfirmationEmail(adminEmail, postData, transport, fromAddr) 
   const database = getDb();
   const token = crypto.randomUUID();
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+  const expiresAt = new Date(now.getTime() + DECISION_TTL_HOURS * 60 * 60 * 1000);
   const decision = {
     token,
     commodity: postData.commodity,
@@ -761,7 +762,7 @@ async function sendOneSector(sector_key, bodyEmails, isTest, settings, transport
     }
     const token = crypto.randomUUID();
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+    const expiresAt = new Date(now.getTime() + DECISION_TTL_HOURS * 60 * 60 * 1000);
     const decision = {
       token,
       commodity: commodity || displayName,
@@ -967,7 +968,7 @@ app.post("/api/send-sector-email", async (req, res) => {
         }
         const token = crypto.randomUUID();
         const now = new Date();
-        const expiresAt = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+        const expiresAt = new Date(now.getTime() + DECISION_TTL_HOURS * 60 * 60 * 1000);
         const decision = {
           token,
           commodity: commodity || displayName,
@@ -1050,18 +1051,21 @@ app.get("/api/admin/decision", async (req, res) => {
   const { token, type } = req.query || {};
   const database = getDb();
   if (!token || typeof token !== "string") {
-    return redirectOrConfigError(res, "expired");
+    console.warn("Admin decision: no token or invalid token format in URL");
+    return redirectOrConfigError(res, "invalid");
   }
   if (!database) {
-    return redirectOrConfigError(res, "expired");
+    console.warn("Admin decision: MongoDB not connected");
+    return redirectOrConfigError(res, "invalid");
   }
   const doc = await database.collection("admin_decisions").findOne({ token });
   if (!doc) {
-    console.warn("Admin decision: token not found", token);
-    return redirectOrConfigError(res, "expired");
+    console.warn("Admin decision: token not found in DB", token);
+    return redirectOrConfigError(res, "invalid");
   }
   const now = new Date();
   if (new Date(doc.expires_at) < now) {
+    console.warn("Admin decision: token expired (TTL passed)", { token, expires_at: doc.expires_at });
     return redirectOrConfigError(res, "expired");
   }
   if (doc.status !== "pending") {
@@ -1069,7 +1073,8 @@ app.get("/api/admin/decision", async (req, res) => {
   }
   const action = type === "approve" ? "approved" : type === "reject" ? "rejected" : null;
   if (!action) {
-    return redirectOrConfigError(res, "expired");
+    console.warn("Admin decision: invalid type param", { token, type });
+    return redirectOrConfigError(res, "invalid");
   }
   await database.collection("admin_decisions").updateOne(
     { token },
