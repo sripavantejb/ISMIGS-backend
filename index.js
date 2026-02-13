@@ -145,11 +145,19 @@ function getSectorType(sector_key) {
   return "custom";
 }
 
+function extractHashtagsFromText(text) {
+  const tags = [];
+  const re = /#[\w]+/g;
+  let m;
+  while ((m = re.exec(text)) !== null) tags.push(m[0]);
+  return tags;
+}
+
 async function generateSectorSamplePost(sector_key, displayName) {
   if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required for test emails");
   const sectorType = getSectorType(sector_key);
   const systemPrompt =
-    "You are a macro intelligence writer for ISMIGS (India State Macro Intelligence). Subscribers receive sector-specific notifications and updates on the ISMIGS dashboard. Write a short LinkedIn-style post that summarizes the kind of notifications and updates this sector sees: use the sector type and name to tailor content (e.g. IIP = industrial production indices and growth; WPI = wholesale price inflation; Energy = supply, consumption, and commodity prices; GVA = industry-wise GVA; Custom = general macro and policy updates). Be professional, data-driven, and suitable for policymakers and analysts. Maximum 150 words. No hashtags.";
+    "You are a macro intelligence writer for ISMIGS (India State Macro Intelligence). Subscribers receive sector-specific notifications and updates on the ISMIGS dashboard. Write a short LinkedIn-style post that summarizes the kind of notifications and updates this sector sees: use the sector type and name to tailor content (e.g. IIP = industrial production indices and growth; WPI = wholesale price inflation; Energy = supply, consumption, and commodity prices; GVA = industry-wise GVA; Custom = general macro and policy updates). Be professional, data-driven, and suitable for policymakers and analysts. Maximum 150 words. End with 5-8 relevant hashtags (e.g. #ISMIGS #IndiaEconomy #Manufacturing).";
   const userPrompt = `Sector: ${displayName}. Sector type: ${sectorType}. Write a LinkedIn post summarizing the type of notifications and updates this sector would see on the ISMIGS dashboard.`;
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -172,9 +180,11 @@ async function generateSectorSamplePost(sector_key, displayName) {
     throw new Error(`OpenAI API error: ${res.status} ${errText.slice(0, 200)}`);
   }
   const data = await res.json();
-  const text = data.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error("OpenAI returned no content");
-  return text;
+  const rawText = data.choices?.[0]?.message?.content?.trim();
+  if (!rawText) throw new Error("OpenAI returned no content");
+  const hashtags = extractHashtagsFromText(rawText);
+  const linkedin_post_text = rawText.replace(/#[\w]+/g, "").replace(/\n{3,}/g, "\n\n").trim();
+  return { linkedin_post_text: linkedin_post_text || rawText, hashtags };
 }
 
 // ---------- Energy disclosure: AdminDecisions, n8n, confirmation email ----------
@@ -186,6 +196,24 @@ const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || process.env.VITE_APP_
 function getDecisionRedirectUrl(result) {
   const base = FRONTEND_BASE_URL.replace(/\/$/, "");
   return `${base}/admin/decision?result=${result}`;
+}
+
+function getBackendPublicUrl() {
+  return (process.env.BACKEND_PUBLIC_URL || process.env.API_BASE_URL || "").replace(/\/$/, "") || `http://localhost:${process.env.PORT || 3001}`;
+}
+
+function appendConfirmationBlock(linkedin_post_text, hashtags, token) {
+  const base = getBackendPublicUrl();
+  const approveLink = `${base}/api/admin/decision?token=${token}&type=approve`;
+  const rejectLink = `${base}/api/admin/decision?token=${token}&type=reject`;
+  const hashtagStr = Array.isArray(hashtags) ? hashtags.join(" ") : (hashtags || "");
+  const textSuffix =
+    `\n\nHashtags: ${hashtagStr}\n\n---\nDo you want to post this on LinkedIn?\nYes: ${approveLink}\nNo: ${rejectLink}`;
+  const htmlSuffix =
+    `<p>Hashtags: ${hashtagStr}</p>` +
+    `<p><strong>Do you want to post this on LinkedIn?</strong></p>` +
+    `<p><a href="${approveLink}" style="display:inline-block;margin-right:12px;padding:8px 16px;background:#0a66c2;color:#fff;text-decoration:none;border-radius:6px;">Yes</a> <a href="${rejectLink}" style="display:inline-block;padding:8px 16px;background:#6c757d;color:#fff;text-decoration:none;border-radius:6px;">No</a></p>`;
+  return { approveLink, rejectLink, textSuffix, htmlSuffix };
 }
 
 async function triggerN8nWebhook(decisionRecord) {
@@ -250,9 +278,7 @@ async function sendConfirmationEmail(adminEmail, postData, transport, fromAddr) 
   if (database) {
     await database.collection("admin_decisions").insertOne(decision);
   }
-  const backendPublicUrl = (process.env.BACKEND_PUBLIC_URL || process.env.API_BASE_URL || "").replace(/\/$/, "") || `http://localhost:${process.env.PORT || 3001}`;
-  const approveLink = `${backendPublicUrl}/api/admin/decision?token=${token}&type=approve`;
-  const rejectLink = `${backendPublicUrl}/api/admin/decision?token=${token}&type=reject`;
+  const { textSuffix: confirmTextSuffix, htmlSuffix: confirmHtmlSuffix } = appendConfirmationBlock(postData.linkedin_post_text, postData.hashtags, token);
 
   const statsLines = postData.stats_summary
     ? [
@@ -265,15 +291,11 @@ async function sendConfirmationEmail(adminEmail, postData, transport, fromAddr) 
       ].filter(Boolean)
     : [];
   const statsBlock = statsLines.length ? `\n\n--- Stats summary ---\n${statsLines.join("\n")}\n` : "";
-  const hashtagStr = Array.isArray(postData.hashtags) ? postData.hashtags.join(" ") : postData.hashtags || "";
-  const text =
-    `${postData.linkedin_post_text}\n${statsBlock}\nHashtags: ${hashtagStr}\n\n---\nDo you want to post this on LinkedIn?\nYes: ${approveLink}\nNo: ${rejectLink}`;
+  const text = `${postData.linkedin_post_text}\n${statsBlock}` + confirmTextSuffix;
   const html =
     `<p style="white-space:pre-wrap;">${postData.linkedin_post_text.replace(/\n/g, "<br>")}</p>` +
     (statsLines.length ? `<p><strong>Stats summary</strong><br>${statsLines.join("<br>")}</p>` : "") +
-    `<p>Hashtags: ${hashtagStr}</p>` +
-    `<p><strong>Do you want to post this on LinkedIn?</strong></p>` +
-    `<p><a href="${approveLink}" style="display:inline-block;margin-right:12px;padding:8px 16px;background:#0a66c2;color:#fff;text-decoration:none;border-radius:6px;">Yes</a> <a href="${rejectLink}" style="display:inline-block;padding:8px 16px;background:#6c757d;color:#fff;text-decoration:none;border-radius:6px;">No</a></p>`;
+    confirmHtmlSuffix;
 
   await transport.sendMail({
     from: fromAddr,
@@ -614,8 +636,57 @@ async function sendOneSector(sector_key, bodyEmails, isTest, settings, transport
   let text, html;
   if (isTest) {
     if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required for test emails.");
-    text = await generateSectorSamplePost(sector_key, displayName);
-    html = text.replace(/\n/g, "<br>");
+    let linkedin_post_text, hashtags, commodity, production, consumption, import_dependency, risk_score, projected_deficit_year, sector_impact;
+    const sectorType = getSectorType(sector_key);
+    if (sectorType === "energy") {
+      try {
+        const postData = await generateLinkedInPost(displayName);
+        linkedin_post_text = postData.linkedin_post_text;
+        hashtags = postData.hashtags;
+        commodity = postData.commodity;
+        production = postData.production;
+        consumption = postData.consumption;
+        import_dependency = postData.import_dependency;
+        risk_score = postData.risk_score;
+        projected_deficit_year = postData.projected_deficit_year;
+        sector_impact = postData.sector_impact;
+      } catch (e) {
+        const fallback = await generateSectorSamplePost(sector_key, displayName);
+        linkedin_post_text = fallback.linkedin_post_text;
+        hashtags = fallback.hashtags;
+        commodity = displayName;
+      }
+    } else {
+      const fallback = await generateSectorSamplePost(sector_key, displayName);
+      linkedin_post_text = fallback.linkedin_post_text;
+      hashtags = fallback.hashtags;
+      commodity = displayName;
+    }
+    const token = crypto.randomUUID();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+    const decision = {
+      token,
+      commodity: commodity || displayName,
+      linkedin_post_text,
+      hashtags: Array.isArray(hashtags) ? hashtags : [hashtags].filter(Boolean),
+      status: "pending",
+      created_at: now,
+      expires_at: expiresAt,
+      responded_at: null,
+      production: production ?? null,
+      consumption: consumption ?? null,
+      import_dependency: import_dependency ?? null,
+      risk_score: risk_score ?? null,
+      projected_deficit_year: projected_deficit_year ?? null,
+      sector_impact: sector_impact ?? null,
+    };
+    if (database) {
+      await database.collection("admin_decisions").insertOne(decision);
+    }
+    const { textSuffix, htmlSuffix } = appendConfirmationBlock(linkedin_post_text, hashtags, token);
+    text = linkedin_post_text + textSuffix;
+    html = `<p style="white-space:pre-wrap;">${linkedin_post_text.replace(/\n/g, "<br>")}</p>` + htmlSuffix;
   } else {
     text = `Update for sector: ${displayName}.`;
     html = text.replace(/\n/g, "<br>");
@@ -771,8 +842,57 @@ app.post("/api/send-sector-email", async (req, res) => {
         return res.status(503).json({ error: "OPENAI_API_KEY required for test emails." });
       }
       try {
-        text = await generateSectorSamplePost(sector_key, displayName);
-        html = text.replace(/\n/g, "<br>");
+        let linkedin_post_text, hashtags, commodity, production, consumption, import_dependency, risk_score, projected_deficit_year, sector_impact;
+        const sectorType = getSectorType(sector_key);
+        if (sectorType === "energy") {
+          try {
+            const postData = await generateLinkedInPost(displayName);
+            linkedin_post_text = postData.linkedin_post_text;
+            hashtags = postData.hashtags;
+            commodity = postData.commodity;
+            production = postData.production;
+            consumption = postData.consumption;
+            import_dependency = postData.import_dependency;
+            risk_score = postData.risk_score;
+            projected_deficit_year = postData.projected_deficit_year;
+            sector_impact = postData.sector_impact;
+          } catch (e) {
+            const fallback = await generateSectorSamplePost(sector_key, displayName);
+            linkedin_post_text = fallback.linkedin_post_text;
+            hashtags = fallback.hashtags;
+            commodity = displayName;
+          }
+        } else {
+          const fallback = await generateSectorSamplePost(sector_key, displayName);
+          linkedin_post_text = fallback.linkedin_post_text;
+          hashtags = fallback.hashtags;
+          commodity = displayName;
+        }
+        const token = crypto.randomUUID();
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+        const decision = {
+          token,
+          commodity: commodity || displayName,
+          linkedin_post_text,
+          hashtags: Array.isArray(hashtags) ? hashtags : [hashtags].filter(Boolean),
+          status: "pending",
+          created_at: now,
+          expires_at: expiresAt,
+          responded_at: null,
+          production: production ?? null,
+          consumption: consumption ?? null,
+          import_dependency: import_dependency ?? null,
+          risk_score: risk_score ?? null,
+          projected_deficit_year: projected_deficit_year ?? null,
+          sector_impact: sector_impact ?? null,
+        };
+        if (database) {
+          await database.collection("admin_decisions").insertOne(decision);
+        }
+        const { textSuffix, htmlSuffix } = appendConfirmationBlock(linkedin_post_text, hashtags, token);
+        text = linkedin_post_text + textSuffix;
+        html = `<p style="white-space:pre-wrap;">${linkedin_post_text.replace(/\n/g, "<br>")}</p>` + htmlSuffix;
       } catch (e) {
         return res.status(500).json({ error: e.message || "Sector LinkedIn post generation failed." });
       }
@@ -925,24 +1045,24 @@ app.post("/api/send-energy-disclosure", async (req, res) => {
 
 const RISK_THRESHOLD = Number(process.env.ENERGY_RISK_THRESHOLD) || 40;
 
-app.get("/api/cron/sector-critical-alerts", async (req, res) => {
-  const secret = req.headers.authorization?.replace(/^Bearer\s+/i, "") || req.query?.secret || "";
-  if (secret !== CRON_SECRET) {
-    return res.status(401).json({ error: "Unauthorized." });
-  }
+function slugifyCommodity(s) {
+  return String(s).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+}
+
+async function runSectorCriticalAlerts() {
   const database = getDb();
   if (!database) {
-    return res.status(503).json({ error: "MongoDB not configured." });
+    throw new Error("MongoDB not configured.");
   }
   let commodities;
   try {
     commodities = await listCommodities();
   } catch (e) {
-    return res.status(502).json({ error: "Failed to fetch commodities: " + e.message });
+    throw new Error("Failed to fetch commodities: " + e.message);
   }
   const results = [];
-  let transport, fromAddr;
   const settings = await getSettings();
+  let transport, fromAddr;
   if (smtpHost && smtpUser && smtpPass) {
     fromAddr = getFrom(settings);
     transport = nodemailer.createTransport({
@@ -957,10 +1077,9 @@ app.get("/api/cron/sector-critical-alerts", async (req, res) => {
       transport = ethereal.transport;
       fromAddr = ethereal.fromAddr;
     } catch (e) {
-      return res.status(503).json({ error: "No SMTP or Ethereal available." });
+      throw new Error("No SMTP or Ethereal available.");
     }
   }
-  const slugify = (s) => String(s).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
   for (const commodityName of commodities) {
     let stats;
     try {
@@ -970,7 +1089,7 @@ app.get("/api/cron/sector-critical-alerts", async (req, res) => {
     }
     const isCritical = stats.riskScore >= RISK_THRESHOLD || (stats.projectedDeficitYear != null);
     if (!isCritical) continue;
-    const sectorKey = `energy:${slugify(commodityName)}`;
+    const sectorKey = `energy:${slugifyCommodity(commodityName)}`;
     const row = await database.collection("sector_recipients").findOne({ sector_key: sectorKey, enabled: true });
     const recipients = row?.emails || [];
     if (recipients.length === 0) continue;
@@ -996,6 +1115,7 @@ app.get("/api/cron/sector-critical-alerts", async (req, res) => {
           risk_score: stats.riskScore,
           sent_at: sentAt,
           alert_type: stats.projectedDeficitYear ? "projected_deficit" : "risk_threshold",
+          recipient_count: recipients.length,
         });
         results.push({ commodity: commodityName, sector: sec.name, sent: recipients.length });
       } catch (e) {
@@ -1003,7 +1123,84 @@ app.get("/api/cron/sector-critical-alerts", async (req, res) => {
       }
     }
   }
-  res.json({ ok: true, results });
+  return { results };
+}
+
+app.get("/api/cron/sector-critical-alerts", async (req, res) => {
+  const secret = req.headers.authorization?.replace(/^Bearer\s+/i, "") || req.query?.secret || "";
+  if (secret !== CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized." });
+  }
+  try {
+    const { results } = await runSectorCriticalAlerts();
+    res.json({ ok: true, results });
+  } catch (e) {
+    if (e.message === "MongoDB not configured.") return res.status(503).json({ error: e.message });
+    if (e.message.startsWith("Failed to fetch commodities")) return res.status(502).json({ error: e.message });
+    if (e.message === "No SMTP or Ethereal available.") return res.status(503).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Sector alerts log (admin) ----------
+
+app.get("/api/sector-alerts-log", async (req, res) => {
+  const database = getDb();
+  if (!database) {
+    return res.status(503).json({ error: "MongoDB not configured." });
+  }
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  const offset = parseInt(req.query.offset, 10) || 0;
+  const commodity = typeof req.query.commodity === "string" ? req.query.commodity.trim() : null;
+  const since = typeof req.query.since === "string" ? req.query.since.trim() : null;
+  const filter = {};
+  if (commodity) filter.commodity = commodity;
+  if (since) {
+    const sinceDate = new Date(since);
+    if (!isNaN(sinceDate.getTime())) filter.sent_at = { $gte: sinceDate };
+  }
+  try {
+    const col = database.collection("sector_alerts_log");
+    const [items, total] = await Promise.all([
+      col.find(filter).sort({ sent_at: -1 }).skip(offset).limit(limit).toArray(),
+      col.countDocuments(filter),
+    ]);
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const summaryCursor = col.find({ sent_at: { $gte: sevenDaysAgo } });
+    const summaryItems = await summaryCursor.toArray();
+    const totalLast7Days = summaryItems.length;
+    const byCommodity = {};
+    for (const row of summaryItems) {
+      const c = row.commodity || "Unknown";
+      byCommodity[c] = (byCommodity[c] || 0) + 1;
+    }
+    res.json({
+      items: items.map((doc) => ({
+        id: doc._id.toString(),
+        commodity: doc.commodity,
+        sector: doc.sector,
+        risk_score: doc.risk_score,
+        sent_at: doc.sent_at ? new Date(doc.sent_at).toISOString() : null,
+        alert_type: doc.alert_type,
+        recipient_count: doc.recipient_count ?? 0,
+      })),
+      total,
+      summary: { totalLast7Days, byCommodity },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/admin/run-sector-alerts", requireAuth, async (req, res) => {
+  try {
+    const { results } = await runSectorCriticalAlerts();
+    res.json({ ok: true, results });
+  } catch (e) {
+    if (e.message === "MongoDB not configured.") return res.status(503).json({ error: e.message });
+    if (e.message.startsWith("Failed to fetch commodities")) return res.status(502).json({ error: e.message });
+    res.status(500).json({ error: e.message || "Run sector alerts failed." });
+  }
 });
 
 app.post("/api/send-email", async (req, res) => {
