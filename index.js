@@ -926,11 +926,27 @@ async function triggerN8nWebhookForLinkedInPost(postRecord, sectorName, approved
   params.set("approved_at", approvedAtIso);
   params.set("sector_name", String(sectorName || postRecord.sector_name || ""));
   params.set("approved_by", String(approvedBy ?? ""));
+  const sector_name = String(sectorName || postRecord.sector_name || "");
+  const approved_by = String(approvedBy ?? "");
+  console.log("[sector approval] Webhook request data:", {
+    webhook_base: SECTOR_APPROVAL_WEBHOOK_URL.replace(/\?.*/, ""),
+    params: {
+      commodity: String(postRecord.commodity ?? ""),
+      linkedin_post_text: fullContent.length > 200 ? fullContent.slice(0, 200) + "..." : fullContent,
+      hashtags: hashtagsArr,
+      approved_at: approvedAtIso,
+      sector_name,
+      approved_by,
+    },
+  });
   const separator = SECTOR_APPROVAL_WEBHOOK_URL.includes("?") ? "&" : "?";
   const url = `${SECTOR_APPROVAL_WEBHOOK_URL}${separator}${params.toString()}`;
+  console.log("[sector approval] Sending GET to webhook:", url);
   const doGet = async () => {
     const res = await fetch(url, { method: "GET" });
-    if (!res.ok) throw new Error(`n8n webhook ${res.status}: ${await res.text()}`);
+    const body = await res.text();
+    if (!res.ok) throw new Error(`n8n webhook ${res.status}: ${body}`);
+    console.log("[sector approval] Webhook GET success:", res.status, body || "(empty body)");
   };
   try {
     await doGet();
@@ -949,11 +965,20 @@ app.post("/api/sector-admin/decision", requireSectorAdmin, async (req, res) => {
   const database = getDb();
   if (!database) return res.status(503).json({ error: "MongoDB not configured." });
   const { post_id, decision } = req.body || {};
+  console.log("[sector approval] Incoming request:", { post_id, decision });
   if (!post_id || (decision !== "approve" && decision !== "reject")) return res.status(400).json({ error: "post_id and decision (approve|reject) are required." });
   let oid;
   try { oid = new ObjectId(post_id); } catch { return res.status(404).json({ error: "Post not found." }); }
   const post = await database.collection("linkedin_posts").findOne({ _id: oid });
   if (!post) return res.status(404).json({ error: "Post not found." });
+  console.log("[sector approval] LinkedIn content (from DB):", {
+    commodity: post.commodity,
+    post_content: post.post_content,
+    hashtags: post.hashtags,
+    production: post.production,
+    consumption: post.consumption,
+    risk_score: post.risk_score,
+  });
   const sector_id = req.user.sector_id;
   const sectorKey = req.user.sectorKey;
   const belongs = sector_id ? post.sector_id && post.sector_id.toString() === sector_id : post.sector_key === sectorKey;
