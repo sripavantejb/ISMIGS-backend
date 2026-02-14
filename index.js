@@ -18,7 +18,7 @@ import { insertAuditLog } from "./services/auditLog.js";
 
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const JWT_SECRET = process.env.JWT_SECRET || "ismigs-dev-secret-change-in-production";
 const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || "admin").trim();
@@ -1839,6 +1839,172 @@ app.get("/api/energy-commodities", async (_req, res) => {
   } catch (e) {
     res.status(502).json({ error: e.message || "Failed to fetch commodities." });
   }
+});
+
+// Farmers: disease detection from image (base64). Demo when PLANT_ID_API_KEY unset.
+const PLANT_ID_API_KEY = (process.env.PLANT_ID_API_KEY || process.env.PLANTID_API_KEY || "").trim();
+const PLANT_ID_HEALTH_URL = "https://api.plant.id/v2/health_assessment";
+const MAX_IMAGE_BASE64_LENGTH = 10 * 1024 * 1024; // ~7.5MB decoded
+
+const DEMO_DIAGNOSES = [
+  {
+    name: "Early blight",
+    confidence: 0.87,
+    description: "Fungal disease often seen as dark concentric rings on leaves. Common in tomato and potato.",
+    recommendations: ["Remove and destroy affected leaves.", "Apply copper-based fungicide.", "Improve air circulation and avoid overhead watering."],
+    treatmentSuggestions: ["Spray copper oxychloride 0.25% at 10-day intervals.", "Use resistant varieties next season."],
+    fertilizersOrPesticides: ["Copper-based fungicide", "Chlorothalonil (as per label)"],
+  },
+  {
+    name: "Leaf spot",
+    confidence: 0.82,
+    description: "Small circular lesions on leaves, often caused by fungi or bacteria.",
+    recommendations: ["Remove infected plant material.", "Apply appropriate fungicide per label.", "Water at base to keep foliage dry."],
+    treatmentSuggestions: ["Remove affected leaves; spray Mancozeb or Carbendazim as per label."],
+    fertilizersOrPesticides: ["Mancozeb", "Carbendazim", "Neem oil (preventive)"],
+  },
+  {
+    name: "Powdery mildew",
+    confidence: 0.79,
+    description: "White or gray powdery coating on leaves and stems.",
+    recommendations: ["Apply sulfur- or potassium bicarbonate-based fungicide.", "Reduce humidity and improve airflow.", "Remove severely affected parts."],
+    treatmentSuggestions: ["Spray wettable sulfur or potassium bicarbonate; repeat after 7–10 days."],
+    fertilizersOrPesticides: ["Wettable sulfur", "Potassium bicarbonate", "Sulfur dust"],
+  },
+];
+
+function extractBase64(imageInput) {
+  if (!imageInput || typeof imageInput !== "string") return null;
+  const s = imageInput.trim();
+  const dataUrlMatch = s.match(/^data:image\/\w+;base64,(.+)$/);
+  const base64 = dataUrlMatch ? dataUrlMatch[1] : s;
+  return base64.replace(/\s/g, "");
+}
+
+app.post("/api/farmers/disease-detection", async (req, res) => {
+  try {
+    const rawImage = req.body?.image;
+    const base64 = extractBase64(rawImage);
+    if (!base64 || base64.length > MAX_IMAGE_BASE64_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid or missing image. Send a base64 image (or data URL) under 10MB.",
+      });
+    }
+
+    if (PLANT_ID_API_KEY) {
+      const plantIdRes = await fetch(PLANT_ID_HEALTH_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_key: PLANT_ID_API_KEY,
+          images: [base64],
+          plant_details: ["auto"],
+        }),
+      });
+      if (!plantIdRes.ok) {
+        const errText = await plantIdRes.text();
+        console.error("Plant.id health_assessment error:", plantIdRes.status, errText);
+        return res.status(502).json({
+          success: false,
+          error: "Plant identification service temporarily unavailable.",
+        });
+      }
+      const plantIdJson = await plantIdRes.json();
+      const health = plantIdJson?.health_assessment ?? plantIdJson?.result?.health_assessment ?? plantIdJson;
+      const suggestions = health?.diseases ?? health?.suggestions ?? [];
+      const primarySuggestion = suggestions[0];
+      const primary = primarySuggestion
+        ? {
+            name: primarySuggestion.name ?? primarySuggestion.disease ?? "Unknown condition",
+            confidence: typeof primarySuggestion.probability === "number" ? primarySuggestion.probability : primarySuggestion.confidence ?? 0.8,
+            description: primarySuggestion.description ?? null,
+          }
+        : { name: "No disease detected", confidence: 0.9, description: "Plant appears healthy. Monitor for changes." };
+      const alternatives = (suggestions.slice(1, 4) || []).map((s) => ({
+        name: s.name ?? s.disease ?? "Unknown",
+        confidence: typeof s.probability === "number" ? s.probability : s.confidence ?? 0,
+      }));
+      const recommendations = health?.recommendations ?? primarySuggestion?.treatment ?? [
+        "Confirm diagnosis with an agronomist or extension officer.",
+        "Follow label instructions for any recommended treatments.",
+      ];
+      const recList = Array.isArray(recommendations) ? recommendations : [recommendations].filter(Boolean);
+      return res.json({
+        success: true,
+        diagnosis: {
+          primary,
+          alternatives,
+          recommendations: recList.length ? recList : ["Confirm with your state agriculture department or local expert."],
+          treatmentSuggestions: recList.length ? recList.slice(0, 3) : [],
+          fertilizersOrPesticides: [],
+        },
+        disclaimer: "AI-assisted result. Confirm with an agronomist or state agriculture department.",
+      });
+    }
+
+    const demo = DEMO_DIAGNOSES[Math.abs(crypto.createHash("md5").update(base64.slice(0, 256)).digest().readUInt32BE(0)) % DEMO_DIAGNOSES.length];
+    return res.json({
+      success: true,
+      diagnosis: {
+        primary: {
+          name: demo.name,
+          confidence: demo.confidence,
+          description: demo.description,
+        },
+        alternatives: DEMO_DIAGNOSES.filter((d) => d.name !== demo.name).slice(0, 2).map((d) => ({ name: d.name, confidence: d.confidence - 0.1 })),
+        recommendations: demo.recommendations,
+        treatmentSuggestions: demo.treatmentSuggestions || [],
+        fertilizersOrPesticides: demo.fertilizersOrPesticides || [],
+      },
+      disclaimer: "Demo result. Set PLANT_ID_API_KEY for real AI-based disease detection.",
+    });
+  } catch (e) {
+    console.error("disease-detection error:", e);
+    return res.status(500).json({ success: false, error: e.message || "Analysis failed." });
+  }
+});
+
+// Farmers: in-memory profile and alert preferences (MVP; replace with DB when adding farmer auth)
+const farmersProfileStore = new Map();
+const farmersAlertStore = new Map();
+
+app.get("/api/farmers/profile", (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "") || "anonymous";
+  const profile = farmersProfileStore.get(token);
+  if (!profile) return res.status(200).json({ profile: null });
+  return res.json({ profile });
+});
+
+app.put("/api/farmers/profile", (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "") || "anonymous";
+  const profile = req.body;
+  if (!profile || typeof profile !== "object") return res.status(400).json({ error: "Invalid profile." });
+  farmersProfileStore.set(token, { ...profile, updatedAt: new Date().toISOString() });
+  return res.json({ profile: farmersProfileStore.get(token) });
+});
+
+app.get("/api/farmers/alert-preferences", (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "") || "anonymous";
+  const prefs = farmersAlertStore.get(token);
+  return res.json({ preferences: prefs || [] });
+});
+
+app.put("/api/farmers/alert-preferences", (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "") || "anonymous";
+  const { preferences } = req.body || {};
+  if (!Array.isArray(preferences)) return res.status(400).json({ error: "Invalid preferences." });
+  farmersAlertStore.set(token, preferences);
+  return res.json({ preferences });
+});
+
+app.get("/api/farmers/prices", (req, res) => {
+  const prices = [
+    { type: "fertilizer", value: 24.5, unit: "₹/kg (urea indicative)", trend: "up", updatedAt: new Date().toISOString() },
+    { type: "diesel", value: 87.5, unit: "₹/litre", trend: "stable", updatedAt: new Date().toISOString() },
+    { type: "electricity", value: 6.2, unit: "₹/kWh (agri indicative)", trend: "up", updatedAt: new Date().toISOString() },
+  ];
+  return res.json({ prices });
 });
 
 const OPENAI_KEY_REQUIRED_MSG =
