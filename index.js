@@ -305,6 +305,7 @@ async function generateSectorSamplePost(sector_key, displayName) {
 // ---------- Energy disclosure: AdminDecisions, n8n, confirmation email ----------
 
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
+const SECTOR_APPROVAL_WEBHOOK_URL = process.env.SECTOR_APPROVAL_WEBHOOK_URL || N8N_WEBHOOK_URL;
 const CRON_SECRET = process.env.CRON_SECRET || "change-me-cron-secret";
 const DECISION_TTL_HOURS = Number(process.env.DECISION_TOKEN_TTL_HOURS) || 168; // 7 days default (was 48h)
 
@@ -320,7 +321,7 @@ function getFrontendBaseUrl() {
 function getDecisionRedirectUrl(result) {
   const base = getFrontendBaseUrl();
   if (!base) return null;
-  return `${base}/admin/decision?result=${result}`;
+  return `${base}/admin-panel?result=${result}`;
 }
 
 const FRONTEND_URL_CONFIG_HTML =
@@ -904,8 +905,8 @@ app.get("/api/sector-admin/posts", requireSectorAdmin, async (req, res) => {
 });
 
 async function triggerN8nWebhookForLinkedInPost(postRecord, sectorName, approvedBy, approvedAt) {
-  if (!N8N_WEBHOOK_URL) {
-    console.warn("N8N_WEBHOOK_URL not set; skipping webhook.");
+  if (!SECTOR_APPROVAL_WEBHOOK_URL) {
+    console.warn("SECTOR_APPROVAL_WEBHOOK_URL and N8N_WEBHOOK_URL not set; skipping webhook.");
     return;
   }
   const fullContent = postRecord.post_content ?? "";
@@ -925,8 +926,8 @@ async function triggerN8nWebhookForLinkedInPost(postRecord, sectorName, approved
   params.set("approved_at", approvedAtIso);
   params.set("sector_name", String(sectorName || postRecord.sector_name || ""));
   params.set("approved_by", String(approvedBy ?? ""));
-  const separator = N8N_WEBHOOK_URL.includes("?") ? "&" : "?";
-  const url = `${N8N_WEBHOOK_URL}${separator}${params.toString()}`;
+  const separator = SECTOR_APPROVAL_WEBHOOK_URL.includes("?") ? "&" : "?";
+  const url = `${SECTOR_APPROVAL_WEBHOOK_URL}${separator}${params.toString()}`;
   const doGet = async () => {
     const res = await fetch(url, { method: "GET" });
     if (!res.ok) throw new Error(`n8n webhook ${res.status}: ${await res.text()}`);
