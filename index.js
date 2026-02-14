@@ -904,49 +904,54 @@ app.get("/api/sector-admin/posts", requireSectorAdmin, async (req, res) => {
   }
 });
 
-async function triggerN8nWebhookForLinkedInPost(postRecord, sectorName, approvedBy, approvedAt) {
+async function triggerN8nWebhookForLinkedInPost(postRecord, sectorName, approvedBy, approvedAt, post_id, decision) {
   if (!SECTOR_APPROVAL_WEBHOOK_URL) {
     console.warn("SECTOR_APPROVAL_WEBHOOK_URL and N8N_WEBHOOK_URL not set; skipping webhook.");
     return;
   }
-  const fullContent = postRecord.post_content ?? "";
-  const approvedAtIso = approvedAt ? new Date(approvedAt).toISOString() : new Date().toISOString();
+  const commodity = String(postRecord.commodity ?? "");
+  const post_content = postRecord.post_content ?? "";
   const hashtagsArr = Array.isArray(postRecord.hashtags) ? postRecord.hashtags : [];
+  const approvedAtIso = approvedAt ? new Date(approvedAt).toISOString() : new Date().toISOString();
+  const sector_name = String(sectorName || postRecord.sector_name || "");
+  const approved_by = String(approvedBy ?? "");
+
+  const payload = {
+    request: { post_id, decision },
+    linkedin_content: { commodity, post_content, hashtags: hashtagsArr },
+    approved_at: approvedAtIso,
+    sector_name,
+    approved_by,
+  };
+  console.log("[sector approval] Webhook payload (same as console structure):", payload);
+
   const params = new URLSearchParams();
-  params.set("commodity", String(postRecord.commodity ?? ""));
+  params.set("post_id", String(post_id ?? ""));
+  params.set("decision", String(decision ?? ""));
+  params.set("commodity", commodity);
+  params.set("post_content", post_content);
+  params.set("linkedin_post_text", post_content);
+  params.set("body", post_content);
+  params.set("hashtags", JSON.stringify(hashtagsArr));
+  params.set("approved_at", approvedAtIso);
+  params.set("sector_name", sector_name);
+  params.set("approved_by", approved_by);
   if (postRecord.production != null) params.set("production", String(postRecord.production));
   if (postRecord.consumption != null) params.set("consumption", String(postRecord.consumption));
   if (postRecord.import_dependency != null) params.set("import_dependency", String(postRecord.import_dependency));
   if (postRecord.risk_score != null) params.set("risk_score", String(postRecord.risk_score));
   if (postRecord.projected_deficit_year != null) params.set("projected_deficit_year", String(postRecord.projected_deficit_year));
   if (postRecord.sector_impact != null) params.set("sector_impact", String(postRecord.sector_impact));
-  params.set("linkedin_post_text", fullContent);
-  params.set("body", fullContent);
-  params.set("hashtags", JSON.stringify(hashtagsArr));
-  params.set("approved_at", approvedAtIso);
-  params.set("sector_name", String(sectorName || postRecord.sector_name || ""));
-  params.set("approved_by", String(approvedBy ?? ""));
-  const sector_name = String(sectorName || postRecord.sector_name || "");
-  const approved_by = String(approvedBy ?? "");
-  console.log("[sector approval] Webhook request data:", {
-    webhook_base: SECTOR_APPROVAL_WEBHOOK_URL.replace(/\?.*/, ""),
-    params: {
-      commodity: String(postRecord.commodity ?? ""),
-      linkedin_post_text: fullContent.length > 200 ? fullContent.slice(0, 200) + "..." : fullContent,
-      hashtags: hashtagsArr,
-      approved_at: approvedAtIso,
-      sector_name,
-      approved_by,
-    },
-  });
+
   const separator = SECTOR_APPROVAL_WEBHOOK_URL.includes("?") ? "&" : "?";
   const url = `${SECTOR_APPROVAL_WEBHOOK_URL}${separator}${params.toString()}`;
   console.log("[sector approval] Sending GET to webhook:", url);
+
   const doGet = async () => {
     const res = await fetch(url, { method: "GET" });
     const body = await res.text();
+    console.log("[sector approval] Webhook request status:", res.status, res.statusText, "body:", body);
     if (!res.ok) throw new Error(`n8n webhook ${res.status}: ${body}`);
-    console.log("[sector approval] Webhook GET success:", res.status, body || "(empty body)");
   };
   try {
     await doGet();
@@ -1001,7 +1006,7 @@ app.post("/api/sector-admin/decision", requireSectorAdmin, async (req, res) => {
           if (sec) sectorName = sec.sector_name || "";
         }
     try {
-      await triggerN8nWebhookForLinkedInPost(post, sectorName, req.user.id, now);
+      await triggerN8nWebhookForLinkedInPost(post, sectorName, req.user.id, now, post_id, decision);
       webhookSent = true;
     } catch (err) {
       console.error("n8n webhook error after sector approval:", err.message);
